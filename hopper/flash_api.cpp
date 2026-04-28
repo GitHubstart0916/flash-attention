@@ -704,6 +704,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
+        bool only_qv,
         int64_t sm_margin
         ) {
 
@@ -1048,6 +1049,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             params.qv_batch_stride = q_v.stride(0);
         }
     }
+    TORCH_CHECK(!only_qv || q_v_.has_value(), "only_qv requires q_v to be provided");
+    params.only_qv = only_qv;
 
     if (rotary_cos_.has_value()) {
         TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
@@ -1705,6 +1708,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
+        "bool only_qv = False,"
         "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"

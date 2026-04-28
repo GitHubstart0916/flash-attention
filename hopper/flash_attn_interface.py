@@ -83,6 +83,7 @@ def _flash_attn_forward(
     scheduler_metadata: Optional[torch.Tensor] = None,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
+    only_qv: bool = False,
     sm_margin: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
@@ -130,6 +131,7 @@ def _flash_attn_forward(
         scheduler_metadata,
         num_splits,
         pack_gqa,
+        only_qv,
         sm_margin,
     )
 
@@ -177,6 +179,7 @@ def _flash_attn_forward_fake(
     scheduler_metadata: Optional[torch.Tensor] = None,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
+    only_qv: bool = False,
     sm_margin: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -558,6 +561,7 @@ class FlashAttnFunc(torch.autograd.Function):
         softcap=0.0,
         num_splits=1,
         pack_gqa=None,
+        only_qv=False,
         deterministic=False,
         sm_margin=0,
         return_softmax=False,
@@ -586,6 +590,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            only_qv=only_qv,
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
@@ -628,7 +633,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -654,6 +659,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         softcap=0.0,
         num_splits=1,
         pack_gqa=None,
+        only_qv=False,
         deterministic=False,
         sm_margin=0,
         return_softmax=False,
@@ -686,6 +692,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            only_qv=only_qv,
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -733,7 +740,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -811,6 +818,7 @@ def flash_attn_func(
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
+    only_qv=False,
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
@@ -873,6 +881,7 @@ def flash_attn_func(
         softcap,
         num_splits,
         pack_gqa,
+        only_qv,
         deterministic,
         sm_margin,
         return_attn_probs,
@@ -898,6 +907,7 @@ def flash_attn_varlen_func(
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
+    only_qv=False,
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
@@ -921,6 +931,7 @@ def flash_attn_varlen_func(
         softcap,
         num_splits,
         pack_gqa,
+        only_qv,
         deterministic,
         sm_margin,
         return_attn_probs,
@@ -932,9 +943,9 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
 
 
 def flash_attn_with_kvcache(
-    q,
-    k_cache,
-    v_cache,
+    q: Optional[torch.Tensor],
+    k_cache: Optional[torch.Tensor],
+    v_cache: torch.Tensor,
     k=None,
     v=None,
     qv=None,
@@ -960,6 +971,7 @@ def flash_attn_with_kvcache(
     scheduler_metadata=None,
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
+    only_qv=False,
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
 ):
@@ -1006,10 +1018,10 @@ def flash_attn_with_kvcache(
     Note: Does not support backward pass.
 
     Arguments:
-        q: (batch_size, seqlen, nheads, headdim)
+        q: (batch_size, seqlen, nheads, headdim). Can be None only when only_qv=True.
         k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
-            page_block_size can be arbitrary (e.g, 1, 2, 3, 64, etc.).
+            page_block_size can be arbitrary (e.g, 1, 2, 3, 64, etc.). Can be None only when only_qv=True.
         v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
@@ -1048,13 +1060,47 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    if v_cache is None:
+        raise ValueError("v_cache must be provided")
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    if k_cache is None:
+        if not only_qv:
+            raise ValueError("k_cache can only be None when only_qv=True")
+        if q is not None:
+            k_head_size = q.shape[-1]
+            k_dtype = q.dtype
+            k_device = q.device
+        elif k is not None:
+            k_head_size = k.shape[-1]
+            k_dtype = k.dtype
+            k_device = k.device
+        else:
+            # raise ValueError("When k_cache is None, provide q or k to infer key head dimension")
+            k_head_size = 64
+            k_dtype = v_cache.dtype
+            k_device = v_cache.device
+        k_shape = (*v_cache.shape[:-1], k_head_size)
+        # The kernel path for only_qv ignores K values, but backend API still requires k tensor.
+        k_cache = torch.empty(k_shape, dtype=k_dtype, device=k_device)
+    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    if q is None:
+        if not only_qv:
+            raise ValueError("q can only be None when only_qv=True")
+        if qv is None:
+            raise ValueError("q must be provided unless qv is provided with only_qv=True")
+        q_shape = (*qv.shape[:-1], k_cache.shape[-1])
+        # The kernel path for only_qv ignores q values, but backend API still requires q tensor.
+        q = torch.empty(q_shape, dtype=qv.dtype, device=qv.device)
     if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+        if only_qv:
+            if qv is None:
+                raise ValueError("only_qv=True requires qv to be provided")
+            softmax_scale = (qv.shape[-1]) ** (-0.5)
+        else:
+            softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
-            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=v_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
     out, softmax_lse, *rest = _flash_attn_forward(
@@ -1089,6 +1135,7 @@ def flash_attn_with_kvcache(
         scheduler_metadata=scheduler_metadata,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
+        only_qv=only_qv,
         sm_margin=sm_margin,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
