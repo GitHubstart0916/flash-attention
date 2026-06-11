@@ -595,6 +595,9 @@ class AttentionMask:
         head_divmod=None,
         vec_size: cutlass.Constexpr[int] = 1,
         check_q_boundary: bool = False,
+        compress_ratio: Int32 | int = 1,
+        swa_seqlen: Optional[Int32] = None,
+        swa_window_size: Optional[Int32] = None,
         r2p: bool = True,
         rBitmask: Optional[cute.Tensor] = None,
     ) -> None:
@@ -620,6 +623,34 @@ class AttentionMask:
                     curr_col = col_start + j
                     mask = (curr_mask_val >> j) & 1
                     acc_S[curr_col] = acc_S[curr_col] if cutlass.Boolean(mask) else -Float32.inf
+
+        elif const_expr(swa_window_size is not None):
+            assert swa_seqlen is not None, "CSA SWA mask requires swa_seqlen"
+            row_idx = tScS_t2r[0][0] + m_block * self.tile_m
+            if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                row_idx = row_idx // self.qhead_per_kvhead_packgqa
+            q_pos = row_idx + swa_seqlen - self.seqlen_q
+            comp_limit = (row_idx + 1) // compress_ratio
+            for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
+                kv_idx = tScS_t2r[i][1] + n_block * self.tile_n
+                out_of_bounds = row_idx >= self.seqlen_q
+                if const_expr(mask_seqlen):
+                    out_of_bounds = out_of_bounds or kv_idx >= self.seqlen_k
+                if kv_idx < swa_seqlen:
+                    acc_S[i] = (
+                        -Float32.inf
+                        if out_of_bounds
+                        or q_pos < kv_idx
+                        or q_pos - kv_idx >= swa_window_size
+                        else acc_S[i]
+                    )
+                else:
+                    comp_idx = kv_idx - swa_seqlen
+                    acc_S[i] = (
+                        -Float32.inf
+                        if out_of_bounds or comp_idx >= comp_limit
+                        else acc_S[i]
+                    )
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
@@ -682,6 +713,8 @@ class AttentionMask:
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
             if const_expr(mask_causal):
                 col_limit_right = row_idx + causal_row_offset + 1
+                if compress_ratio != 1:
+                    col_limit_right = (row_idx + 1) // compress_ratio - n_block * self.tile_n + self.seqlen_k - self.seqlen_q // compress_ratio
                 if const_expr(mask_seqlen):
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 # if cute.arch.thread_idx()[0] % 32 == 0:

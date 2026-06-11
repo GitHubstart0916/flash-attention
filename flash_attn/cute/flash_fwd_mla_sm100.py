@@ -57,6 +57,8 @@ class FlashAttentionMLAForwardSm100:
         use_cpasync_load_KV: bool = False,
         topk_length: int = 2048,
         is_topk_gather: bool = True,
+        is_local: bool = False,
+        has_csa_swa: bool = False,
         pack_gqa: bool = False,
         qhead_per_kvhead: int = 1,
         nheads_kv: int = 1,
@@ -69,6 +71,7 @@ class FlashAttentionMLAForwardSm100:
     ):
         self.is_causal = is_causal
         self.is_local = False
+        self.has_csa_swa = has_csa_swa
         self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
         self.nheads_kv = nheads_kv
@@ -360,12 +363,14 @@ class FlashAttentionMLAForwardSm100:
         mRowMax: Optional[cute.Tensor] = None,      # (b, s_q, topk // tile_n, h)  or (total_q, topk // tile_n, h) if there is cu_seqlens_q
         mCuSeqlensQ: Optional[cute.Tensor] = None,  # (b + 1)
         mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
+        mCuSeqlensSwa: Optional[cute.Tensor] = None,  # (b + 1)
         mSeqUsedQ: Optional[cute.Tensor] = None,    # (b)
         mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
         mIndexTopk: Optional[cute.Tensor] = None,   # (b, s_q, topk)  or (total_q, topk) if there is cu_seqlens_q
         mPageTable: Optional[cute.Tensor] = None,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
+        mLearnableSink: Optional[cute.Tensor] = None,
+        swa_window_size: Int32 | int | None = None,
+        compress_ratio: Int32 | int = 1,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -712,10 +717,12 @@ class FlashAttentionMLAForwardSm100:
             mRowMax,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mCuSeqlensSwa,
             mSeqUsedQ,
             mSeqUsedK,
             mIndexTopk,
             mPageTable,
+            mLearnableSink,
             tma_atom_Q,
             tma_atom_Qv,
             tma_atom_K,
@@ -740,6 +747,8 @@ class FlashAttentionMLAForwardSm100:
             tiled_mma_PVt,
             softmax_scale,
             softmax_scale_log2,
+            swa_window_size,
+            compress_ratio,
             topk_length_dynamic,
             tile_sched_params,
             SharedStorage,
@@ -769,10 +778,12 @@ class FlashAttentionMLAForwardSm100:
         mRowMax: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
+        mCuSeqlensSwa: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mIndexTopk: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        mLearnableSink: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_Qv: cute.CopyAtom,
         tma_atom_K: Optional[cute.CopyAtom],
@@ -797,6 +808,8 @@ class FlashAttentionMLAForwardSm100:
         tiled_mma_PVt: cute.TiledMma,
         softmax_scale: Float32,
         softmax_scale_log2: Float32,
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
         topk_length_dynamic: Optional[Int32],
         tile_sched_params: ParamsBase,
         SharedStorage: cutlass.Constexpr[Callable],
@@ -961,6 +974,9 @@ class FlashAttentionMLAForwardSm100:
             self.cta_tile_m * self.cta_group_size,
             self.tile_n,
             is_causal=self.is_causal,
+            is_local=self.is_local,
+            window_size_left=None,
+            window_size_right=None,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
@@ -980,6 +996,8 @@ class FlashAttentionMLAForwardSm100:
             AttentionMask,
             self.cta_tile_m * self.cta_group_size,
             self.tile_n,
+            window_size_left=None,
+            window_size_right=None,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
@@ -1180,6 +1198,10 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_bitmask,
                 sO_empty_mbar_ptr,
                 AttentionMaskCls,
+                mLearnableSink,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
                 topk_length_dynamic,
                 block_info,
                 SeqlenInfoCls,
@@ -1216,6 +1238,7 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_sm_stats,
                 sO_empty_mbar_ptr,
                 tiled_copy_O_r2g,
+                mLearnableSink,
                 topk_length_dynamic,
                 block_info,
                 SeqlenInfoCls,
@@ -1293,6 +1316,9 @@ class FlashAttentionMLAForwardSm100:
                 n_block_min = 0
                 n_block_max = self.topk_length // self.tile_n
                 # n_block_max = topk_length_dynamic // self.tile_n
+            elif const_expr(self.is_causal):
+                n_block_min = 0
+                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -1408,6 +1434,9 @@ class FlashAttentionMLAForwardSm100:
                 n_block_min = 0
                 n_block_max = self.topk_length // self.tile_n
                 # n_block_max = topk_length_dynamic // self.tile_n
+            elif const_expr(self.is_causal):
+                n_block_min = 0
+                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -1872,6 +1901,9 @@ class FlashAttentionMLAForwardSm100:
                 n_block_min = 0
                 n_block_max = self.topk_length // self.tile_n
                 # n_block_max = topk_length_dynamic // self.tile_n
+            elif const_expr(self.is_causal):
+                n_block_min = 0
+                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -2278,6 +2310,9 @@ class FlashAttentionMLAForwardSm100:
                 n_block_min = 0
                 # n_block_max = self.topk_length // self.tile_n
                 n_block_max = topk_length_dynamic // self.tile_n
+            elif const_expr(self.is_causal):
+                n_block_min = 0
+                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -2469,6 +2504,10 @@ class FlashAttentionMLAForwardSm100:
         pipeline_bitmask: Optional[pipeline.PipelineAsync],
         sO_empty_mbar_ptr: Optional[cute.Pointer],
         AttentionMaskCls: Callable,
+        learnable_sink: Optional[cute.Tensor],
+        mCuSeqlensSwa: Optional[cute.Tensor],
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -2539,10 +2578,17 @@ class FlashAttentionMLAForwardSm100:
             cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             cluster_m_block = cta_m_block // self.cta_group_size
             seqlen = SeqlenInfoCls(batch_idx)
+            swa_seqlen = None
+            if const_expr(self.has_csa_swa):
+                assert mCuSeqlensSwa is not None, "CSA SWA requires mCuSeqlensSwa"
+                swa_seqlen = mCuSeqlensSwa[batch_idx + 1] - mCuSeqlensSwa[batch_idx]
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
                 n_block_max = self.topk_length // self.tile_n
                 # n_block_max = topk_length_dynamic // self.tile_n
+            elif const_expr(self.is_causal):
+                n_block_min = 0
+                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -2591,6 +2637,9 @@ class FlashAttentionMLAForwardSm100:
                 mask_local=self.is_local,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
+                compress_ratio=compress_ratio,
+                swa_seqlen=swa_seqlen,
+                swa_window_size=swa_window_size if const_expr(self.has_csa_swa) else None,
                 r2p=False,  # TODO: fix r2p for 2cta
             )
             disable_mask = self.disable_bitmask and self.is_topk_gather
@@ -2689,7 +2738,12 @@ class FlashAttentionMLAForwardSm100:
                         1 - stage,
                         n_block,
                         mask_fn=partial(mask_fn, mask_seqlen=False)
-                        if const_expr(self.is_topk_gather and not self.disable_bitmask)
+                        if const_expr(
+                            self.is_causal
+                            or self.is_local
+                            or self.has_csa_swa
+                            or (self.is_topk_gather and not self.disable_bitmask)
+                        )
                         else None,
                     )
                     n_block -= 1
@@ -2717,7 +2771,7 @@ class FlashAttentionMLAForwardSm100:
 
             # write row max and sum to smem
             sRowSum[tidx % self.cta_tile_m, warp_idx // self.cta_group_size] = softmax.row_sum[0]
-            if const_expr(mLSE is not None):
+            if const_expr(mLSE is not None or learnable_sink is not None):
                 if tidx < self.cta_tile_m:
                     sRowMax[tidx, 0] = softmax.row_max[0]
             self.sm_stats_barrier_full.arrive()
@@ -2858,6 +2912,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_sm_stats: pipeline.PipelineAsync,
         sO_empty_mbar_ptr: Optional[cute.Pointer],
         tiled_copy_O_r2g: cute.TiledCopy,
+        learnable_sink: Optional[cute.Tensor],
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -2933,6 +2988,9 @@ class FlashAttentionMLAForwardSm100:
                 n_block_min = 0
                 n_block_max = self.topk_length // self.tile_n
                 # n_block_max = topk_length_dynamic // self.tile_n
+            elif const_expr(self.is_causal):
+                n_block_min = 0
+                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -3006,6 +3064,28 @@ class FlashAttentionMLAForwardSm100:
             row_sum0 = sRowSum[tidx % self.cta_tile_m, 0]
             row_sum1 = sRowSum[tidx % self.cta_tile_m, 1]
             row_sum = row_sum0 + row_sum1
+            row_max = None
+            if const_expr(mLSE is not None or learnable_sink is not None):
+                row_max = sRowMax[tidx % self.cta_tile_m, 0]
+            if const_expr(learnable_sink is not None):
+                if const_expr(not self.pack_gqa):
+                    sink_val = Float32(learnable_sink[head_idx])
+                else:
+                    packed_row_idx = cta_m_block * self.cta_tile_m + tidx % self.cta_tile_m
+                    q_head_idx = (
+                        packed_row_idx % self.qhead_per_kvhead
+                        + head_idx * self.qhead_per_kvhead
+                    )
+                    sink_val = Float32(learnable_sink[q_head_idx])
+                LOG2_E = math.log2(math.e)
+                if row_max == -Float32.inf:
+                    row_max = sink_val * (LOG2_E / softmax_scale_log2)
+                    row_sum = 1.0
+                else:
+                    row_sum += cute.math.exp2(
+                        sink_val * LOG2_E - row_max * softmax_scale_log2,
+                        fastmath=True,
+                    )
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
 
@@ -3028,7 +3108,6 @@ class FlashAttentionMLAForwardSm100:
                     mLSE_cur = cute.domain_offset((lse_offset,), mLSE[None, head_idx])
                 gLSE = cute.local_tile(mLSE_cur, (self.cta_tile_m,), (cta_m_block,))
                 if tidx < self.cta_tile_m:
-                    row_max = sRowMax[tidx, 0]
                     LN2 = math.log(2.0)
                     lse = (
                         (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True))

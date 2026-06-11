@@ -10,7 +10,6 @@ from typing import Optional, Tuple, Callable
 import torch
 
 
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
@@ -55,7 +54,6 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
-    get_block_sparse_broadcast_pattern,
 )
 
 def _parse_arch_str(arch_str):
@@ -294,12 +292,15 @@ def _flash_attn_fwd(
     k: Optional[torch.Tensor],
     v: torch.Tensor,
     qv: Optional[torch.Tensor] = None,
+    swa_kv: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_swa: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    max_seqlen_swa: Optional[int] = None,
     min_seqlen_k: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
@@ -326,6 +327,8 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    compress_ratio: int = 1,
+    swa_window_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -340,10 +343,16 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
-    q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
+    q, k, v, qv, swa_kv = [maybe_contiguous(t) for t in (q, k, v, qv, swa_kv)]
     assert q is not None or qv is not None
     assert v is not None
+    assert compress_ratio >= 1, "compress_ratio must be >= 1"
     q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
+    has_csa_swa = (
+        swa_kv is not None
+        or cu_seqlens_swa is not None
+        or swa_window_size is not None
+    )
     q_shape = q.shape if q is not None else qv.shape
     num_head, head_dim = q_shape[-2:]
     if cu_seqlens_q is None:
@@ -353,6 +362,52 @@ def _flash_attn_fwd(
         batch_size = cu_seqlens_q.shape[0] - 1
         seqlen_q = None
         total_q = q_shape[0]
+    if has_csa_swa:
+        assert qv is not None, "CSA SWA is only supported by the MLA qv path"
+        assert q is None, "CSA SWA expects the absorbed MLA path with q=None"
+        assert k is None, "CSA SWA expects shared-kv specialization with k=None"
+        assert cu_seqlens_q is not None and cu_seqlens_k is not None, (
+            "CSA SWA currently requires varlen q and compressed-kv cu_seqlens"
+        )
+        assert seqused_k is None, "CSA SWA does not support seqused_k"
+        assert page_table is None, "CSA SWA does not support paged KV"
+        assert gather_kv_indices is None, "CSA SWA does not support gather_kv_indices"
+        assert swa_window_size is not None, "swa_window_size is required with swa_kv"
+        assert not causal, "CSA SWA uses its own mask; pass causal=False"
+        assert window_size_left is None and window_size_right is None, (
+            "CSA SWA uses swa_window_size instead of the normal window_size mask"
+        )
+        if cu_seqlens_swa is None:
+            cu_seqlens_swa = torch.zeros(batch_size + 1, dtype=torch.int32, device=v.device)
+        assert swa_kv is None or swa_kv.dim() == 3, "CSA SWA expects varlen swa_kv"
+        assert v.dim() == 3, "CSA SWA expects varlen compressed kv"
+        assert swa_kv is None or swa_kv.shape[1:] == v.shape[1:], (
+            "swa_kv and compressed kv must have the same head/dim"
+        )
+        cu_swa_cpu = cu_seqlens_swa.detach().cpu().tolist()
+        cu_comp_cpu = cu_seqlens_k.detach().cpu().tolist()
+        assert len(cu_swa_cpu) == batch_size + 1 and len(cu_comp_cpu) == batch_size + 1
+        assert swa_kv is not None or cu_swa_cpu[-1] == 0, (
+            "cu_seqlens_swa must describe zero SWA tokens when swa_kv is None"
+        )
+        pieces = []
+        combined_cu = [0]
+        max_combined = 0
+        min_combined = None
+        for batch_idx in range(batch_size):
+            swa_start, swa_end = cu_swa_cpu[batch_idx], cu_swa_cpu[batch_idx + 1]
+            comp_start, comp_end = cu_comp_cpu[batch_idx], cu_comp_cpu[batch_idx + 1]
+            if swa_kv is not None:
+                pieces.append(swa_kv[swa_start:swa_end])
+            pieces.append(v[comp_start:comp_end])
+            combined_len = (swa_end - swa_start) + (comp_end - comp_start)
+            combined_cu.append(combined_cu[-1] + combined_len)
+            max_combined = max(max_combined, combined_len)
+            min_combined = combined_len if min_combined is None else min(min_combined, combined_len)
+        v = torch.cat(pieces, dim=0)
+        cu_seqlens_k = torch.tensor(combined_cu, dtype=torch.int32, device=v.device)
+        max_seqlen_k = max_combined
+        min_seqlen_k = min_combined
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
         assert page_table.dtype == torch.int32, "page_table must be int32"
@@ -394,7 +449,7 @@ def _flash_attn_fwd(
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
     
-    input_tensors = {"q": q, "k": k, "v": v, "qv": qv}
+    input_tensors = {"q": q, "k": k, "v": v, "qv": qv, "swa_kv": swa_kv}
     present = {name: t for name, t in input_tensors.items() if t is not None}
     names = list(present.keys())
     for i in range(len(names)):
@@ -404,7 +459,7 @@ def _flash_attn_fwd(
 
     q_dtype = q.dtype if q is not None else qv.dtype
 
-    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+    for t in [cu_seqlens_q, cu_seqlens_k, cu_seqlens_swa, seqused_q, seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, (
                 "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
@@ -429,6 +484,7 @@ def _flash_attn_fwd(
                 v_descale,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                cu_seqlens_swa,
                 seqused_q,
                 seqused_k,
                 page_table,
@@ -665,17 +721,16 @@ def _flash_attn_fwd(
         assert qv.shape[-1] == head_dim_v
         assert head_dim_v == 512
         assert q is None or head_dim == 64
-        assert not local, "local not yet supported with qv"
         assert q_descale is None and k_descale is None and v_descale is None, (
             "q_descale/k_descale/v_descale are not yet supported with qv"
         )
         assert tile_n == 128
 
         assert not is_split_kv, "split kv not supported with qv"
-        assert learnable_sink is None
         assert softcap is None
         assert score_mod is None
         assert mask_mod is None
+        assert not local, "local window is not supported with qv; use swa_kv/swa_window_size for CSA"
 
         if page_table is not None:
             assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
@@ -723,6 +778,8 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,
+        has_csa_swa,
+        swa_window_size is not None,
         learnable_sink is not None,
         q_descale is not None,
         k_descale is not None,
@@ -756,6 +813,7 @@ def _flash_attn_fwd(
         (
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
+            cu_seqlens_swa_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
             learnable_sink_tensor,
@@ -763,7 +821,14 @@ def _flash_attn_fwd(
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
+            for t in (
+                cu_seqlens_q,
+                cu_seqlens_k,
+                cu_seqlens_swa,
+                seqused_q,
+                seqused_k,
+                learnable_sink,
+            )
         ]
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
@@ -874,6 +939,7 @@ def _flash_attn_fwd(
                     use_cpasync_load_KV=sparse_kv or paged_kv_cpasync,
                     topk_length=gather_kv_length,
                     is_topk_gather=sparse_kv,
+                    has_csa_swa=has_csa_swa,
                     pack_gqa=pack_gqa,
                     qhead_per_kvhead=qhead_per_kvhead,
                     nheads_kv=num_head_kv,
@@ -983,12 +1049,14 @@ def _flash_attn_fwd(
                 row_max_tensor,
                 cu_seqlens_q_tensor,
                 cu_seqlens_k_tensor,
+                cu_seqlens_swa_tensor,
                 seqused_q_tensor,
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                learnable_sink_tensor,
+                swa_window_size,
+                compress_ratio,
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1050,12 +1118,14 @@ def _flash_attn_fwd(
                 row_max,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                cu_seqlens_swa,
                 seqused_q,
                 seqused_k,
                 gather_kv_indices,
                 page_table,
-                window_size_left,
-                window_size_right,
+                learnable_sink,
+                swa_window_size,
+                compress_ratio,
             )
         else:
             call_args = [
@@ -1978,6 +2048,7 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
+        compress_ratio: int = 1,
     ):
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
@@ -2005,6 +2076,7 @@ class FlashAttnFunc(torch.autograd.Function):
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            compress_ratio=compress_ratio,
         )
         ctx.save_for_backward(q, k, v, out, lse, *(aux_tensors or ()))
         ctx.softmax_scale = softmax_scale
@@ -2082,6 +2154,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        compress_ratio: int = 1,
+        swa_kv: Optional[torch.Tensor] = None,
+        cu_seqlens_swa: Optional[torch.Tensor] = None,
+        max_seqlen_swa: Optional[int] = None,
+        swa_window_size: Optional[int] = None,
     ):
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
@@ -2095,12 +2172,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             k,
             v,
             qv=qv,
+            swa_kv=swa_kv,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
+            cu_seqlens_swa=cu_seqlens_swa,
             seqused_q=seqused_q,
             seqused_k=seqused_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            max_seqlen_swa=max_seqlen_swa,
             min_seqlen_k=min_seqlen_k,
             page_table=page_table,
             softmax_scale=softmax_scale,
@@ -2117,6 +2197,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            compress_ratio=compress_ratio,
+            swa_window_size=swa_window_size,
         )
         ctx.save_for_backward(
             q,
@@ -2200,6 +2282,7 @@ def flash_attn_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    compress_ratio: int = 1,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -2222,6 +2305,7 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        compress_ratio,
     )
 
 
@@ -2253,6 +2337,11 @@ def flash_attn_varlen_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    compress_ratio: int = 1,
+    swa_kv: Optional[torch.Tensor] = None,
+    cu_seqlens_swa: Optional[torch.Tensor] = None,
+    max_seqlen_swa: Optional[int] = None,
+    swa_window_size: Optional[int] = None,
 ):
     """
     Tensor arguments:
@@ -2313,6 +2402,11 @@ def flash_attn_varlen_func(
         block_sparse_tensors,
         aux_tensors,
         return_lse,
+        compress_ratio,
+        swa_kv,
+        cu_seqlens_swa,
+        max_seqlen_swa,
+        swa_window_size,
     )
 
 
