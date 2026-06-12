@@ -6,7 +6,7 @@ import enum
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Uint32, const_expr
+from cutlass import Boolean, Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import min as dsl_min
 
 from quack import layout_utils
@@ -598,6 +598,8 @@ class AttentionMask:
         compress_ratio: Int32 | int = 1,
         swa_seqlen: Optional[Int32] = None,
         swa_window_size: Optional[Int32] = None,
+        csa_kv_offset: Optional[Int32] = None,
+        csa_source_is_swa: Optional[Boolean] = None,
         r2p: bool = True,
         rBitmask: Optional[cute.Tensor] = None,
     ) -> None:
@@ -632,7 +634,10 @@ class AttentionMask:
             q_pos = row_idx + swa_seqlen - self.seqlen_q
             comp_limit = (row_idx + 1) // compress_ratio
             for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
-                kv_idx = tScS_t2r[i][1] + n_block * self.tile_n
+                kv_base = n_block * self.tile_n
+                if const_expr(csa_kv_offset is not None):
+                    kv_base = csa_kv_offset
+                kv_idx = tScS_t2r[i][1] + kv_base
                 out_of_bounds = row_idx >= self.seqlen_q
                 if const_expr(mask_seqlen):
                     out_of_bounds = out_of_bounds or kv_idx >= self.seqlen_k
@@ -646,11 +651,18 @@ class AttentionMask:
                     )
                 else:
                     comp_idx = kv_idx - swa_seqlen
-                    acc_S[i] = (
-                        -Float32.inf
-                        if out_of_bounds or comp_idx >= comp_limit
-                        else acc_S[i]
-                    )
+                    if const_expr(csa_source_is_swa is not None):
+                        acc_S[i] = (
+                            -Float32.inf
+                            if out_of_bounds or csa_source_is_swa or comp_idx >= comp_limit
+                            else acc_S[i]
+                        )
+                    else:
+                        acc_S[i] = (
+                            -Float32.inf
+                            if out_of_bounds or comp_idx >= comp_limit
+                            else acc_S[i]
+                        )
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):

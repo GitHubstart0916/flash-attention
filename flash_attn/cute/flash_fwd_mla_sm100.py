@@ -59,6 +59,7 @@ class FlashAttentionMLAForwardSm100:
         is_topk_gather: bool = True,
         is_local: bool = False,
         has_csa_swa: bool = False,
+        csa_swa_tile_aligned: bool = True,
         pack_gqa: bool = False,
         qhead_per_kvhead: int = 1,
         nheads_kv: int = 1,
@@ -72,6 +73,7 @@ class FlashAttentionMLAForwardSm100:
         self.is_causal = is_causal
         self.is_local = False
         self.has_csa_swa = has_csa_swa
+        self.csa_swa_tile_aligned = csa_swa_tile_aligned
         self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
         self.nheads_kv = nheads_kv
@@ -356,6 +358,7 @@ class FlashAttentionMLAForwardSm100:
         mQv: cute.Tensor,             # (b, s_q, h, dv)    or (total_q, h, d)    if there is cu_seqlens_q
         mK: Optional[cute.Tensor],    # (b, s_k, h_k, d)   or (total_k, h_k, d)  if there is cu_seqlens_k  or (num_pages, page_size, h_k, d)  if there is page_table
         mV: cute.Tensor,              # (b, s_k, h_k, dv)  or (total_k, h_k, dv) if there is cu_seqlens_k  or (num_pages, page_size, h_k, dv) if there is page_table
+        mSwaV: Optional[cute.Tensor], # (total_swa, h_k, dv) if there is CSA SWA
         mO: cute.Tensor,              # (b, s_q, h, dv)    or (total_q, h, dv)   if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],  # (b, s_q, h)        or (total_q, h)       if there is cu_seqlens_q
         softmax_scale: Float32,
@@ -364,6 +367,7 @@ class FlashAttentionMLAForwardSm100:
         mCuSeqlensQ: Optional[cute.Tensor] = None,  # (b + 1)
         mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
         mCuSeqlensSwa: Optional[cute.Tensor] = None,  # (b + 1)
+        mCuSeqlensComp: Optional[cute.Tensor] = None,  # (b + 1)
         mSeqUsedQ: Optional[cute.Tensor] = None,    # (b)
         mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
         mIndexTopk: Optional[cute.Tensor] = None,   # (b, s_q, topk)  or (total_q, topk) if there is cu_seqlens_q
@@ -388,6 +392,8 @@ class FlashAttentionMLAForwardSm100:
         self.dtype_K = mK.element_type if self.has_qk else cutlass.BFloat16
         self.dtype_Qv = mQv.element_type
         self.dtype_V = mV.element_type
+        if const_expr(mSwaV is not None):
+            assert mSwaV.element_type == self.dtype_V
         self.dtype_P = mV.element_type
         self.dtype_O = mO.element_type
 
@@ -399,11 +405,11 @@ class FlashAttentionMLAForwardSm100:
             *(cute.assume(s, divby=128 // mX.element_type.width) for s in mX.stride[:-1]),
             mX.stride[-1],
         )
-        mQ, mQv, mK, mV, mO, mP = [
+        mQ, mQv, mK, mV, mSwaV, mO, mP = [
             cute.make_tensor(mX.iterator, cute.make_layout(mX.shape, stride=new_stride(mX)))
             if mX is not None
             else None
-            for mX in (mQ, mQv, mK, mV, mO, mP)
+            for mX in (mQ, mQv, mK, mV, mSwaV, mO, mP)
         ]
 
         # (b, s, h, d)  -> (s, d, h, b)  or
@@ -417,16 +423,21 @@ class FlashAttentionMLAForwardSm100:
             else None
             for mX in (mQ, mQv, mO, mP)
         ]
-        mK, mV = [
+        mK, mV, mSwaV = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=KV_layout_transpose))
             if mX is not None
             else None
-            for mX in (mK, mV)
+            for mX in (mK, mV, mSwaV)
         ]
         # (s_k, dv, h_k, b)  -> (dv, s_k, h_k, b) or
         # (total_k, dv, h_k) -> (dv, total_k, h_k)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mVt = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
+        mSwaVt = (
+            cute.make_tensor(mSwaV.iterator, cute.select(mSwaV.layout, mode=V_layout_transpose))
+            if mSwaV is not None
+            else None
+        )
         # (b, s_q, topk) -> (topk, s_q, b) or (total_q, topk) -> (topk, total_q)
         topk_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         mIndexTopk = (
@@ -542,6 +553,8 @@ class FlashAttentionMLAForwardSm100:
             ("tma_atom_K",  "tma_tensor_K",  B, mK,  self.sK_layout,  self.mma_tiler_QK,  tiled_mma_QK,  True),
             ("tma_atom_V",  "tma_tensor_V",  B, mV,  self.sV_layout,  self.mma_tiler_QvV, tiled_mma_QvV, True),
             ("tma_atom_Vt", "tma_tensor_Vt", B, mVt, self.sVt_layout, self.mma_tiler_PVt, tiled_mma_PVt, True),
+            ("tma_atom_SwaV",  "tma_tensor_SwaV",  B, mSwaV,  self.sV_layout,  self.mma_tiler_QvV, tiled_mma_QvV, True),
+            ("tma_atom_SwaVt", "tma_tensor_SwaVt", B, mSwaVt, self.sVt_layout, self.mma_tiler_PVt, tiled_mma_PVt, True),
         ]
         _tmas = {}
         for atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma, kv_only in _tma_specs:
@@ -555,7 +568,9 @@ class FlashAttentionMLAForwardSm100:
          tma_atom_Qv, tma_tensor_Qv,
          tma_atom_K,  tma_tensor_K,
          tma_atom_V,  tma_tensor_V,
-         tma_atom_Vt, tma_tensor_Vt) = _tmas.values()
+         tma_atom_Vt, tma_tensor_Vt,
+         tma_atom_SwaV, tma_tensor_SwaV,
+         tma_atom_SwaVt, tma_tensor_SwaVt) = _tmas.values()
         # fmt: on
 
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
@@ -711,6 +726,8 @@ class FlashAttentionMLAForwardSm100:
             tma_tensor_K if self.use_tma_KV else mK,
             tma_tensor_V if self.use_tma_KV else mV,
             tma_tensor_Vt if self.use_tma_KV else mVt,
+            tma_tensor_SwaV if self.use_tma_KV else mSwaV,
+            tma_tensor_SwaVt if self.use_tma_KV else mSwaVt,
             tma_tensor_O if self.use_tma_O else mO,
             tma_tensor_P,
             mLSE,
@@ -718,6 +735,7 @@ class FlashAttentionMLAForwardSm100:
             mCuSeqlensQ,
             mCuSeqlensK,
             mCuSeqlensSwa,
+            mCuSeqlensComp,
             mSeqUsedQ,
             mSeqUsedK,
             mIndexTopk,
@@ -728,6 +746,8 @@ class FlashAttentionMLAForwardSm100:
             tma_atom_K,
             tma_atom_V,
             tma_atom_Vt,
+            tma_atom_SwaV,
+            tma_atom_SwaVt,
             tma_atom_O,
             tma_atom_P,
             tiled_copy_O_r2g,
@@ -772,6 +792,8 @@ class FlashAttentionMLAForwardSm100:
         mK: Optional[cute.Tensor],
         mV: cute.Tensor,
         mVt: cute.Tensor,
+        mSwaV: Optional[cute.Tensor],
+        mSwaVt: Optional[cute.Tensor],
         mO: cute.Tensor,
         mP: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
@@ -779,6 +801,7 @@ class FlashAttentionMLAForwardSm100:
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mCuSeqlensSwa: Optional[cute.Tensor],
+        mCuSeqlensComp: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mIndexTopk: Optional[cute.Tensor],
@@ -789,6 +812,8 @@ class FlashAttentionMLAForwardSm100:
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
         tma_atom_Vt: Optional[cute.CopyAtom],
+        tma_atom_SwaV: Optional[cute.CopyAtom],
+        tma_atom_SwaVt: Optional[cute.CopyAtom],
         tma_atom_O: Optional[cute.CopyAtom],
         tma_atom_P: Optional[cute.CopyAtom],
         tiled_copy_O_r2g: cute.TiledCopy,
@@ -851,6 +876,9 @@ class FlashAttentionMLAForwardSm100:
                     cpasync.prefetch_descriptor(tma_atom_K)
                 cpasync.prefetch_descriptor(tma_atom_V)
                 cpasync.prefetch_descriptor(tma_atom_Vt)
+                if const_expr(tma_atom_SwaV is not None):
+                    cpasync.prefetch_descriptor(tma_atom_SwaV)
+                    cpasync.prefetch_descriptor(tma_atom_SwaVt)
             if const_expr(self.use_tma_O):
                 cpasync.prefetch_descriptor(tma_atom_O)
 
@@ -1114,6 +1142,8 @@ class FlashAttentionMLAForwardSm100:
                 mQv,
                 mV,
                 mVt,
+                mSwaV,
+                mSwaVt,
                 sQ,
                 sK,
                 sQv,
@@ -1124,6 +1154,8 @@ class FlashAttentionMLAForwardSm100:
                 tma_atom_Qv,
                 tma_atom_V,
                 tma_atom_Vt,
+                tma_atom_SwaV,
+                tma_atom_SwaVt,
                 pipeline_Q,
                 pipeline_K,
                 pipeline_Qv,
@@ -1136,6 +1168,7 @@ class FlashAttentionMLAForwardSm100:
                 block_info,
                 SeqlenInfoCls,
                 mCuSeqlensSwa,
+                mCuSeqlensComp,
                 swa_window_size,
                 compress_ratio,
                 tile_scheduler=tile_scheduler,
@@ -1391,10 +1424,16 @@ class FlashAttentionMLAForwardSm100:
             swa_block_count = swa_block_end - swa_block_min
 
         max_comp_visible = cutlass.min(q_tile_end // compress_ratio, comp_seqlen)
-        comp_block_start = swa_seqlen // self.tile_n
-        comp_block_end = cute.ceil_div(swa_seqlen + max_comp_visible, self.tile_n)
-        if has_swa_block and comp_block_start < swa_block_end:
-            comp_block_start = swa_block_end
+        comp_block_start = 0
+        comp_block_end = 0
+        if const_expr(self.csa_swa_tile_aligned):
+            comp_block_start = swa_seqlen // self.tile_n
+            comp_block_end = cute.ceil_div(swa_seqlen + max_comp_visible, self.tile_n)
+            if has_swa_block and comp_block_start < swa_block_end:
+                comp_block_start = swa_block_end
+        else:
+            comp_block_start = 0
+            comp_block_end = cute.ceil_div(max_comp_visible, self.tile_n)
         comp_block_count = 0
         if max_comp_visible > 0 and comp_block_end > comp_block_start:
             comp_block_count = comp_block_end - comp_block_start
@@ -1402,7 +1441,7 @@ class FlashAttentionMLAForwardSm100:
         return swa_block_min, swa_block_count, comp_block_start, comp_block_count
 
     @cute.jit
-    def get_physical_n_block(
+    def get_source_block_info(
         self,
         n_block: Int32,
         seqlen: SeqlenInfoQK,
@@ -1413,7 +1452,12 @@ class FlashAttentionMLAForwardSm100:
         compress_ratio: Int32,
     ):
         physical_n_block = n_block
+        source_n_block = n_block
+        source_is_swa = False
+        kv_offset = n_block * self.tile_n
+        needs_kv_offset = False
         if const_expr(self.has_csa_swa):
+            assert mCuSeqlensSwa is not None, "CSA SWA requires mCuSeqlensSwa"
             (
                 swa_block_min,
                 swa_block_count,
@@ -1427,12 +1471,28 @@ class FlashAttentionMLAForwardSm100:
                 swa_window_size,
                 compress_ratio,
             )
+            swa_seqlen = mCuSeqlensSwa[batch_idx + 1] - mCuSeqlensSwa[batch_idx]
+            comp_block_base = swa_seqlen // self.tile_n
             physical_n_block = 0
+            source_n_block = 0
+            kv_offset = 0
             if n_block < swa_block_count:
+                source_is_swa = True
                 physical_n_block = swa_block_min + n_block
+                source_n_block = physical_n_block
+                kv_offset = physical_n_block * self.tile_n
+                if const_expr(not self.csa_swa_tile_aligned):
+                    needs_kv_offset = True
             elif comp_block_count > 0:
-                physical_n_block = comp_block_start + n_block - swa_block_count
-        return physical_n_block
+                if const_expr(self.csa_swa_tile_aligned):
+                    physical_n_block = comp_block_start + n_block - swa_block_count
+                    source_n_block = physical_n_block - comp_block_base
+                    kv_offset = physical_n_block * self.tile_n
+                else:
+                    source_n_block = comp_block_start + n_block - swa_block_count
+                    kv_offset = swa_seqlen + source_n_block * self.tile_n
+                    needs_kv_offset = True
+        return source_n_block, source_is_swa, physical_n_block, kv_offset, needs_kv_offset
 
     @cute.jit
     def relay(
@@ -2006,6 +2066,8 @@ class FlashAttentionMLAForwardSm100:
         mQv: cute.Tensor,
         mV: cute.Tensor,
         mVt: cute.Tensor,
+        mSwaV: Optional[cute.Tensor],
+        mSwaVt: Optional[cute.Tensor],
         sQ: Optional[cute.Tensor],
         sK: Optional[cute.Tensor],
         sQv: cute.Tensor,
@@ -2016,6 +2078,8 @@ class FlashAttentionMLAForwardSm100:
         tma_atom_Qv: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         tma_atom_Vt: cute.CopyAtom,
+        tma_atom_SwaV: Optional[cute.CopyAtom],
+        tma_atom_SwaVt: Optional[cute.CopyAtom],
         pipeline_Q: Optional[pipeline.PipelineAsync],
         pipeline_K: Optional[pipeline.PipelineAsync],
         pipeline_Qv: pipeline.PipelineAsync,
@@ -2028,6 +2092,7 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         mCuSeqlensSwa: Optional[cute.Tensor],
+        mCuSeqlensComp: Optional[cute.Tensor],
         swa_window_size: Optional[Int32],
         compress_ratio: Int32,
         tile_scheduler: TileSchedulerProtocol,
@@ -2123,14 +2188,26 @@ class FlashAttentionMLAForwardSm100:
                             (None, 0),
                         )
                     # (seqlen_k, hdimv)
-                    mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
-                    # (hdimv, seqlen_k)
-                    if const_expr(not seqlen.has_cu_seqlens_k):
-                        mVt_cur = mVt[None, None, head_idx_kv, batch_idx]
-                    else:
-                        mVt_cur = cute.domain_offset(
-                            (0, seqlen.offset_k), mVt[None, None, head_idx_kv]
+                    if const_expr(self.has_csa_swa):
+                        assert mCuSeqlensComp is not None, "CSA SWA requires compressed cu_seqlens"
+                        comp_offset = mCuSeqlensComp[batch_idx]
+                        mV_cur = cute.domain_offset(
+                            (comp_offset, 0), mV[None, None, head_idx_kv]
                         )
+                        mVt_cur = cute.domain_offset(
+                            (0, comp_offset), mVt[None, None, head_idx_kv]
+                        )
+                    else:
+                        mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[
+                            None, None, head_idx_kv
+                        ]
+                        # (hdimv, seqlen_k)
+                        if const_expr(not seqlen.has_cu_seqlens_k):
+                            mVt_cur = mVt[None, None, head_idx_kv, batch_idx]
+                        else:
+                            mVt_cur = cute.domain_offset(
+                                (0, seqlen.offset_k), mVt[None, None, head_idx_kv]
+                            )
                     # (tile_n, hdimv//4, num_n_blocks, num_d_blocks=4)
                     gV = cute.local_tile(
                         mV_cur,
@@ -2145,6 +2222,28 @@ class FlashAttentionMLAForwardSm100:
                         (self.mma_tiler_PVt[1], self.mma_tiler_PVt[2]),
                         (None, None),
                     )
+                    if const_expr(mSwaV is not None):
+                        assert mCuSeqlensSwa is not None, "CSA SWA requires mCuSeqlensSwa"
+                        swa_offset = mCuSeqlensSwa[batch_idx]
+                        mSwaV_cur = cute.domain_offset(
+                            (swa_offset, 0), mSwaV[None, None, head_idx_kv]
+                        )
+                        mSwaVt_cur = cute.domain_offset(
+                            (0, swa_offset), mSwaVt[None, None, head_idx_kv]
+                        )
+                        gSwaV = cute.local_tile(
+                            mSwaV_cur,
+                            (self.mma_tiler_QvV[1], self.mma_tiler_QvV[2]),
+                            (None, None),
+                        )
+                        gSwaV = cute.make_tensor(
+                            gSwaV.iterator, cute.select(gSwaV.layout, mode=[0, 1, 3, 2])
+                        )
+                        gSwaVt = cute.local_tile(
+                            mSwaVt_cur,
+                            (self.mma_tiler_PVt[1], self.mma_tiler_PVt[2]),
+                            (None, None),
+                        )
                 else:
                     mPageTable_cur = mPageTable[batch_idx, None]
                     # Paged KV: keep pages dim, index by page_idx at load time
@@ -2201,6 +2300,23 @@ class FlashAttentionMLAForwardSm100:
                     smem_tensor=cute.group_modes(sVt, 0, 3),
                     gmem_tensor=cute.group_modes(tOgVt, 0, 3),
                 )
+                if const_expr(mSwaV is not None):
+                    tSgSwaV = thr_mma_QvV.partition_B(gSwaV)
+                    tOgSwaVt = thr_mma_PVt.partition_B(gSwaVt)
+                    tSwaVsV, tSwaVgV = cpasync.tma_partition(
+                        atom=tma_atom_SwaV,
+                        cta_coord=0,
+                        cta_layout=cute.make_layout(1),
+                        smem_tensor=cute.group_modes(sV, 0, 3),
+                        gmem_tensor=cute.group_modes(tSgSwaV, 0, 3),
+                    )
+                    tSwaVtsVt, tSwaVtgVt = cpasync.tma_partition(
+                        atom=tma_atom_SwaVt,
+                        cta_coord=0,
+                        cta_layout=cute.make_layout(1),
+                        smem_tensor=cute.group_modes(sVt, 0, 3),
+                        gmem_tensor=cute.group_modes(tOgSwaVt, 0, 3),
+                    )
 
             if const_expr(self.has_qk):
                 load_Q = partial(self.load_inner, tma_atom_Q, tQgQ, tQsQ, pipeline_Q)
@@ -2211,6 +2327,13 @@ class FlashAttentionMLAForwardSm100:
                     load_K = partial(self.load_inner, tma_atom_K, tKgK, tKsK, pipeline_K)
                 load_V = partial(self.load_inner, tma_atom_V, tVgV, tVsV, pipeline_V)
                 load_Vt = partial(self.load_inner, tma_atom_Vt, tVtgVt, tVtsVt, pipeline_V)
+                if const_expr(mSwaV is not None):
+                    load_SwaV = partial(
+                        self.load_inner, tma_atom_SwaV, tSwaVgV, tSwaVsV, pipeline_V
+                    )
+                    load_SwaVt = partial(
+                        self.load_inner, tma_atom_SwaVt, tSwaVtgVt, tSwaVtsVt, pipeline_V
+                    )
 
             # ==== Load stationary operands ====
 
@@ -2223,7 +2346,7 @@ class FlashAttentionMLAForwardSm100:
             if const_expr(self.use_tma_KV):
                 # ==== Prologue ====
                 n_block_first = n_block_max - 1 if n_block_max > 0 else 0
-                physical_n_block = self.get_physical_n_block(
+                source_n_block, source_is_swa, _, _, _ = self.get_source_block_info(
                     n_block_first,
                     seqlen,
                     cluster_m_block,
@@ -2232,13 +2355,23 @@ class FlashAttentionMLAForwardSm100:
                     swa_window_size,
                     compress_ratio,
                 )
-                block = self._get_block_idx(physical_n_block, mPageTable_cur)
+                block = self._get_block_idx(source_n_block, mPageTable_cur)
                 # copy K gmem -> smem
                 if const_expr(self.has_qk):
                     producer_state_K = load_K(producer_state_K, block=block)
                 # copy Vi gmem -> smem
                 for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                    producer_state_V = load_V(producer_state_V, block=block, split=split)
+                    if const_expr(mSwaV is not None):
+                        if source_is_swa:
+                            producer_state_V = load_SwaV(
+                                producer_state_V, block=block, split=split
+                            )
+                        else:
+                            producer_state_V = load_V(
+                                producer_state_V, block=block, split=split
+                            )
+                    else:
+                        producer_state_V = load_V(producer_state_V, block=block, split=split)
 
                 if const_expr(self.use_tma_O and self.overlap_sO_sV):
                     cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
@@ -2248,7 +2381,7 @@ class FlashAttentionMLAForwardSm100:
                 for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_stages_S):
                         n_block = n_block_max - 1 - n_block_group * self.num_stages_S - stage
-                        physical_n_block_next = self.get_physical_n_block(
+                        source_n_block_next, source_is_swa_next, _, _, _ = self.get_source_block_info(
                             n_block - 1,
                             seqlen,
                             cluster_m_block,
@@ -2257,7 +2390,7 @@ class FlashAttentionMLAForwardSm100:
                             swa_window_size,
                             compress_ratio,
                         )
-                        physical_n_block = self.get_physical_n_block(
+                        source_n_block, source_is_swa, _, _, _ = self.get_source_block_info(
                             n_block,
                             seqlen,
                             cluster_m_block,
@@ -2266,25 +2399,47 @@ class FlashAttentionMLAForwardSm100:
                             swa_window_size,
                             compress_ratio,
                         )
-                        block_next = self._get_block_idx(physical_n_block_next, mPageTable_cur)
-                        block = self._get_block_idx(physical_n_block, mPageTable_cur)
+                        block_next = self._get_block_idx(source_n_block_next, mPageTable_cur)
+                        block = self._get_block_idx(source_n_block, mPageTable_cur)
                         if const_expr(self.has_qk):
                             # copy K gmem -> smem
                             producer_state_K = load_K(producer_state_K, block=block_next)
                         # copy Vi gmem -> smem
                         for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                            producer_state_V = load_V(
-                                producer_state_V, block=block_next, split=split
-                            )
+                            if const_expr(mSwaV is not None):
+                                if source_is_swa_next:
+                                    producer_state_V = load_SwaV(
+                                        producer_state_V, block=block_next, split=split
+                                    )
+                                else:
+                                    producer_state_V = load_V(
+                                        producer_state_V, block=block_next, split=split
+                                    )
+                            else:
+                                producer_state_V = load_V(
+                                    producer_state_V, block=block_next, split=split
+                                )
                         # copy Vti gmem -> smem
                         for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                            producer_state_V = load_Vt(producer_state_V, block=block, split=split)
+                            if const_expr(mSwaV is not None):
+                                if source_is_swa:
+                                    producer_state_V = load_SwaVt(
+                                        producer_state_V, block=block, split=split
+                                    )
+                                else:
+                                    producer_state_V = load_Vt(
+                                        producer_state_V, block=block, split=split
+                                    )
+                            else:
+                                producer_state_V = load_Vt(
+                                    producer_state_V, block=block, split=split
+                                )
 
                 # ==== Epilogue ====
                 num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
                 for stage in cutlass.range(num_final_n_blocks, unroll_full=True):
                     n_block = n_block_min + num_final_n_blocks - 1 - stage
-                    physical_n_block = self.get_physical_n_block(
+                    source_n_block, source_is_swa, _, _, _ = self.get_source_block_info(
                         n_block,
                         seqlen,
                         cluster_m_block,
@@ -2293,9 +2448,9 @@ class FlashAttentionMLAForwardSm100:
                         swa_window_size,
                         compress_ratio,
                     )
-                    block = self._get_block_idx(physical_n_block, mPageTable_cur)
+                    block = self._get_block_idx(source_n_block, mPageTable_cur)
                     if n_block > n_block_min:
-                        physical_n_block_next = self.get_physical_n_block(
+                        source_n_block_next, source_is_swa_next, _, _, _ = self.get_source_block_info(
                             n_block - 1,
                             seqlen,
                             cluster_m_block,
@@ -2304,18 +2459,38 @@ class FlashAttentionMLAForwardSm100:
                             swa_window_size,
                             compress_ratio,
                         )
-                        block_next = self._get_block_idx(physical_n_block_next, mPageTable_cur)
+                        block_next = self._get_block_idx(source_n_block_next, mPageTable_cur)
                         if const_expr(self.has_qk):
                             # copy K gmem -> smem
                             producer_state_K = load_K(producer_state_K, block=block_next)
                         # copy Vi gmem -> smem
                         for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                            producer_state_V = load_V(
-                                producer_state_V, block=block_next, split=split
-                            )
+                            if const_expr(mSwaV is not None):
+                                if source_is_swa_next:
+                                    producer_state_V = load_SwaV(
+                                        producer_state_V, block=block_next, split=split
+                                    )
+                                else:
+                                    producer_state_V = load_V(
+                                        producer_state_V, block=block_next, split=split
+                                    )
+                            else:
+                                producer_state_V = load_V(
+                                    producer_state_V, block=block_next, split=split
+                                )
                     # copy Vti gmem -> smem
                     for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                        producer_state_V = load_Vt(producer_state_V, block=block, split=split)
+                        if const_expr(mSwaV is not None):
+                            if source_is_swa:
+                                producer_state_V = load_SwaVt(
+                                    producer_state_V, block=block, split=split
+                                )
+                            else:
+                                producer_state_V = load_Vt(
+                                    producer_state_V, block=block, split=split
+                                )
+                        else:
+                            producer_state_V = load_Vt(producer_state_V, block=block, split=split)
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
@@ -2881,7 +3056,7 @@ class FlashAttentionMLAForwardSm100:
 
             ### first iteration ###
             n_block = n_block_max - 1
-            physical_n_block = self.get_physical_n_block(
+            _, source_is_swa, physical_n_block, csa_kv_offset, needs_kv_offset = self.get_source_block_info(
                 n_block,
                 seqlen,
                 cluster_m_block,
@@ -2890,23 +3065,44 @@ class FlashAttentionMLAForwardSm100:
                 swa_window_size,
                 compress_ratio,
             )
-            (
-                consumer_state_S,
-                producer_state_P,
-                producer_state_sm_stats,
-                consumer_state_bitmask,
-            ) = softmax_step_fn(
-                consumer_state_S,
-                producer_state_P,
-                producer_state_sm_stats,
-                consumer_state_bitmask,
-                0,
-                physical_n_block,
-                mask_fn=partial(mask_fn, mask_seqlen=True)
-                if not const_expr(disable_mask)
-                else None,
-                is_first=True,
-            )
+            if const_expr(not self.csa_swa_tile_aligned):
+                (
+                    consumer_state_S,
+                    producer_state_P,
+                    producer_state_sm_stats,
+                    consumer_state_bitmask,
+                ) = softmax_step_fn(
+                    consumer_state_S,
+                    producer_state_P,
+                    producer_state_sm_stats,
+                    consumer_state_bitmask,
+                    0,
+                    n_block,
+                    mask_fn=partial(mask_fn, mask_seqlen=True)
+                    if not const_expr(disable_mask)
+                    else None,
+                    csa_kv_offset=csa_kv_offset,
+                    csa_source_is_swa=source_is_swa,
+                    is_first=True,
+                )
+            else:
+                (
+                    consumer_state_S,
+                    producer_state_P,
+                    producer_state_sm_stats,
+                    consumer_state_bitmask,
+                ) = softmax_step_fn(
+                    consumer_state_S,
+                    producer_state_P,
+                    producer_state_sm_stats,
+                    consumer_state_bitmask,
+                    0,
+                    physical_n_block,
+                    mask_fn=partial(mask_fn, mask_seqlen=True)
+                    if not const_expr(disable_mask)
+                    else None,
+                    is_first=True,
+                )
             n_block -= 1
 
             ### Separate iterations with causal masking
@@ -2922,7 +3118,7 @@ class FlashAttentionMLAForwardSm100:
                 num_n_block_groups -= num_masked_n_block_groups
                 for _ in cutlass.range(num_masked_n_block_groups, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_stages_S):
-                        physical_n_block = self.get_physical_n_block(
+                        _, source_is_swa, physical_n_block, csa_kv_offset, needs_kv_offset = self.get_source_block_info(
                             n_block,
                             seqlen,
                             cluster_m_block,
@@ -2931,6 +3127,77 @@ class FlashAttentionMLAForwardSm100:
                             swa_window_size,
                             compress_ratio,
                         )
+                        if const_expr(not self.csa_swa_tile_aligned):
+                            (
+                                consumer_state_S,
+                                producer_state_P,
+                                producer_state_sm_stats,
+                                consumer_state_bitmask,
+                            ) = softmax_step_fn(
+                                consumer_state_S,
+                                producer_state_P,
+                                producer_state_sm_stats,
+                                consumer_state_bitmask,
+                                1 - stage,
+                                n_block,
+                                mask_fn=partial(mask_fn, mask_seqlen=False),
+                                csa_kv_offset=csa_kv_offset,
+                                csa_source_is_swa=source_is_swa,
+                            )
+                        else:
+                            (
+                                consumer_state_S,
+                                producer_state_P,
+                                producer_state_sm_stats,
+                                consumer_state_bitmask,
+                            ) = softmax_step_fn(
+                                consumer_state_S,
+                                producer_state_P,
+                                producer_state_sm_stats,
+                                consumer_state_bitmask,
+                                1 - stage,
+                                physical_n_block,
+                                mask_fn=partial(mask_fn, mask_seqlen=False),
+                            )
+                        n_block -= 1
+
+            ### Mainloop ###
+            for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
+                for stage in cutlass.range_constexpr(self.num_stages_S):
+                    _, source_is_swa, physical_n_block, csa_kv_offset, needs_kv_offset = self.get_source_block_info(
+                        n_block,
+                        seqlen,
+                        cluster_m_block,
+                        batch_idx,
+                        mCuSeqlensSwa,
+                        swa_window_size,
+                        compress_ratio,
+                    )
+                    if const_expr(not self.csa_swa_tile_aligned):
+                        (
+                            consumer_state_S,
+                            producer_state_P,
+                            producer_state_sm_stats,
+                            consumer_state_bitmask,
+                        ) = softmax_step_fn(
+                            consumer_state_S,
+                            producer_state_P,
+                            producer_state_sm_stats,
+                            consumer_state_bitmask,
+                            1 - stage,
+                            n_block,
+                            mask_fn=partial(mask_fn, mask_seqlen=False)
+                            if const_expr(
+                                self.is_causal
+                                or self.is_local
+                                or self.has_csa_swa
+                                or (self.is_topk_gather and not self.disable_bitmask)
+                            )
+                            else None,
+                            csa_kv_offset=csa_kv_offset,
+                            csa_source_is_swa=source_is_swa,
+                        )
+                    else:
                         (
                             consumer_state_S,
                             producer_state_P,
@@ -2943,22 +3210,30 @@ class FlashAttentionMLAForwardSm100:
                             consumer_state_bitmask,
                             1 - stage,
                             physical_n_block,
-                            mask_fn=partial(mask_fn, mask_seqlen=False),
+                            mask_fn=partial(mask_fn, mask_seqlen=False)
+                            if const_expr(
+                                self.is_causal
+                                or self.is_local
+                                or self.has_csa_swa
+                                or (self.is_topk_gather and not self.disable_bitmask)
+                            )
+                            else None,
                         )
-                        n_block -= 1
+                    n_block -= 1
 
-            ### Mainloop ###
-            for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
-                for stage in cutlass.range_constexpr(self.num_stages_S):
-                    physical_n_block = self.get_physical_n_block(
-                        n_block,
-                        seqlen,
-                        cluster_m_block,
-                        batch_idx,
-                        mCuSeqlensSwa,
-                        swa_window_size,
-                        compress_ratio,
-                    )
+            ### last iteration if even ###
+            # always mask to simplify logic
+            if even_n_blocks:
+                _, source_is_swa, physical_n_block, csa_kv_offset, needs_kv_offset = self.get_source_block_info(
+                    n_block,
+                    seqlen,
+                    cluster_m_block,
+                    batch_idx,
+                    mCuSeqlensSwa,
+                    swa_window_size,
+                    compress_ratio,
+                )
+                if const_expr(not self.csa_swa_tile_aligned):
                     (
                         consumer_state_S,
                         producer_state_P,
@@ -2969,47 +3244,31 @@ class FlashAttentionMLAForwardSm100:
                         producer_state_P,
                         producer_state_sm_stats,
                         consumer_state_bitmask,
-                        1 - stage,
+                        1,
+                        n_block,
+                        mask_fn=partial(mask_fn, mask_seqlen=False)
+                        if not const_expr(disable_mask)
+                        else None,
+                        csa_kv_offset=csa_kv_offset,
+                        csa_source_is_swa=source_is_swa,
+                    )
+                else:
+                    (
+                        consumer_state_S,
+                        producer_state_P,
+                        producer_state_sm_stats,
+                        consumer_state_bitmask,
+                    ) = softmax_step_fn(
+                        consumer_state_S,
+                        producer_state_P,
+                        producer_state_sm_stats,
+                        consumer_state_bitmask,
+                        1,
                         physical_n_block,
                         mask_fn=partial(mask_fn, mask_seqlen=False)
-                        if const_expr(
-                            self.is_causal
-                            or self.is_local
-                            or self.has_csa_swa
-                            or (self.is_topk_gather and not self.disable_bitmask)
-                        )
+                        if not const_expr(disable_mask)
                         else None,
                     )
-                    n_block -= 1
-
-            ### last iteration if even ###
-            # always mask to simplify logic
-            if even_n_blocks:
-                physical_n_block = self.get_physical_n_block(
-                    n_block,
-                    seqlen,
-                    cluster_m_block,
-                    batch_idx,
-                    mCuSeqlensSwa,
-                    swa_window_size,
-                    compress_ratio,
-                )
-                (
-                    consumer_state_S,
-                    producer_state_P,
-                    producer_state_sm_stats,
-                    consumer_state_bitmask,
-                ) = softmax_step_fn(
-                    consumer_state_S,
-                    producer_state_P,
-                    producer_state_sm_stats,
-                    consumer_state_bitmask,
-                    1,
-                    physical_n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=False)
-                    if not const_expr(disable_mask)
-                    else None,
-                )
                 n_block -= 1
 
             # write row max and sum to smem
@@ -3051,6 +3310,8 @@ class FlashAttentionMLAForwardSm100:
         stage: cutlass.Constexpr[Int32],
         n_block: Int32,
         mask_fn: Optional[Callable] = None,
+        csa_kv_offset: Optional[Int32] = None,
+        csa_source_is_swa: Optional[Boolean] = None,
         is_first: Boolean = False,
         store_P: Optional[Callable] = None,
         gRowMax: Optional[cute.Tensor] = None,
@@ -3075,7 +3336,24 @@ class FlashAttentionMLAForwardSm100:
                 rBitmask[i] = sBitmask[bitmask_col_offset + i, consumer_state_bitmask.index]
 
         if const_expr(mask_fn is not None):
-            mask_fn(tSrS_t2r, n_block=n_block, rBitmask=rBitmask)
+            if const_expr(csa_kv_offset is not None):
+                if const_expr(csa_source_is_swa is not None):
+                    mask_fn(
+                        tSrS_t2r,
+                        n_block=n_block,
+                        rBitmask=rBitmask,
+                        csa_kv_offset=csa_kv_offset,
+                        csa_source_is_swa=csa_source_is_swa,
+                    )
+                else:
+                    mask_fn(
+                        tSrS_t2r,
+                        n_block=n_block,
+                        rBitmask=rBitmask,
+                        csa_kv_offset=csa_kv_offset,
+                    )
+            else:
+                mask_fn(tSrS_t2r, n_block=n_block, rBitmask=rBitmask)
 
         # compute threadwise row_max
         row_max = softmax.compute_row_max_local(tSrS_t2r.load(), is_first)

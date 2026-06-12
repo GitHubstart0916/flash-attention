@@ -353,6 +353,8 @@ def _flash_attn_fwd(
         or cu_seqlens_swa is not None
         or swa_window_size is not None
     )
+    cu_seqlens_comp = None
+    csa_swa_tile_aligned = True
     q_shape = q.shape if q is not None else qv.shape
     num_head, head_dim = q_shape[-2:]
     if cu_seqlens_q is None:
@@ -390,21 +392,17 @@ def _flash_attn_fwd(
         assert swa_kv is not None or cu_swa_cpu[-1] == 0, (
             "cu_seqlens_swa must describe zero SWA tokens when swa_kv is None"
         )
-        pieces = []
+        cu_seqlens_comp = cu_seqlens_k
         combined_cu = [0]
         max_combined = 0
         min_combined = None
         for batch_idx in range(batch_size):
             swa_start, swa_end = cu_swa_cpu[batch_idx], cu_swa_cpu[batch_idx + 1]
             comp_start, comp_end = cu_comp_cpu[batch_idx], cu_comp_cpu[batch_idx + 1]
-            if swa_kv is not None:
-                pieces.append(swa_kv[swa_start:swa_end])
-            pieces.append(v[comp_start:comp_end])
             combined_len = (swa_end - swa_start) + (comp_end - comp_start)
             combined_cu.append(combined_cu[-1] + combined_len)
             max_combined = max(max_combined, combined_len)
             min_combined = combined_len if min_combined is None else min(min_combined, combined_len)
-        v = torch.cat(pieces, dim=0)
         cu_seqlens_k = torch.tensor(combined_cu, dtype=torch.int32, device=v.device)
         max_seqlen_k = max_combined
         min_seqlen_k = min_combined
@@ -479,6 +477,7 @@ def _flash_attn_fwd(
                 k,
                 v,
                 qv,
+                swa_kv,
                 q_descale,
                 k_descale,
                 v_descale,
@@ -538,7 +537,8 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
-    if seqlen_k == 0 or total_q == 0:
+    effective_seqlen_k = max_seqlen_k if has_csa_swa else seqlen_k
+    if effective_seqlen_k == 0 or total_q == 0:
         out.zero_()
         if lse is not None:
             lse.fill_(float("-inf"))
@@ -589,6 +589,11 @@ def _flash_attn_fwd(
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    if has_csa_swa:
+        csa_swa_tile_aligned = all(
+            (cu_swa_cpu[i + 1] - cu_swa_cpu[i]) % tile_n == 0
+            for i in range(batch_size)
+        )
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
@@ -779,6 +784,8 @@ def _flash_attn_fwd(
         window_size_left is not None,
         window_size_right is not None,
         has_csa_swa,
+        swa_kv is not None,
+        csa_swa_tile_aligned,
         swa_window_size is not None,
         learnable_sink is not None,
         q_descale is not None,
@@ -814,6 +821,7 @@ def _flash_attn_fwd(
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             cu_seqlens_swa_tensor,
+            cu_seqlens_comp_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
             learnable_sink_tensor,
@@ -825,6 +833,7 @@ def _flash_attn_fwd(
                 cu_seqlens_q,
                 cu_seqlens_k,
                 cu_seqlens_swa,
+                cu_seqlens_comp,
                 seqused_q,
                 seqused_k,
                 learnable_sink,
@@ -882,6 +891,7 @@ def _flash_attn_fwd(
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
         qv_tensor = to_cute_tensor(qv) if qv is not None else None
+        swa_kv_tensor = to_cute_tensor(swa_kv) if swa_kv is not None else None
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices) if gather_kv_indices is not None else None
         p_tensor = to_cute_tensor(p) if p is not None else None
         row_max_tensor = to_cute_tensor(row_max) if row_max is not None else None
@@ -940,6 +950,7 @@ def _flash_attn_fwd(
                     topk_length=gather_kv_length,
                     is_topk_gather=sparse_kv,
                     has_csa_swa=has_csa_swa,
+                    csa_swa_tile_aligned=csa_swa_tile_aligned,
                     pack_gqa=pack_gqa,
                     qhead_per_kvhead=qhead_per_kvhead,
                     nheads_kv=num_head_kv,
@@ -1042,6 +1053,7 @@ def _flash_attn_fwd(
                 qv_tensor,
                 k_tensor,
                 v_tensor,
+                swa_kv_tensor,
                 o_tensor,
                 lse_tensor,
                 softmax_scale,
@@ -1050,6 +1062,7 @@ def _flash_attn_fwd(
                 cu_seqlens_q_tensor,
                 cu_seqlens_k_tensor,
                 cu_seqlens_swa_tensor,
+                cu_seqlens_comp_tensor,
                 seqused_q_tensor,
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
@@ -1111,6 +1124,7 @@ def _flash_attn_fwd(
                 qv_call,
                 k_call,
                 v_call,
+                swa_kv.detach() if swa_kv is not None else None,
                 out.detach(),
                 lse,
                 softmax_scale,
@@ -1119,6 +1133,7 @@ def _flash_attn_fwd(
                 cu_seqlens_q,
                 cu_seqlens_k,
                 cu_seqlens_swa,
+                cu_seqlens_comp,
                 seqused_q,
                 seqused_k,
                 gather_kv_indices,
