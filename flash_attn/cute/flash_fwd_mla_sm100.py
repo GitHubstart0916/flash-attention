@@ -1071,6 +1071,9 @@ class FlashAttentionMLAForwardSm100:
                     topk_length_dynamic,
                     block_info,
                     SeqlenInfoCls,
+                    mCuSeqlensSwa,
+                    swa_window_size,
+                    compress_ratio,
                     tile_scheduler=tile_scheduler,
                 )
 
@@ -1095,6 +1098,9 @@ class FlashAttentionMLAForwardSm100:
                     topk_length_dynamic,
                     block_info,
                     SeqlenInfoCls,
+                    mCuSeqlensSwa,
+                    swa_window_size,
+                    compress_ratio,
                     tile_scheduler=tile_scheduler,
                     mPageTable=mPageTable,
                 )
@@ -1129,6 +1135,9 @@ class FlashAttentionMLAForwardSm100:
                 topk_length_dynamic,
                 block_info,
                 SeqlenInfoCls,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
                 tile_scheduler=tile_scheduler,
                 mPageTable=mPageTable,
             )
@@ -1169,6 +1178,9 @@ class FlashAttentionMLAForwardSm100:
                 topk_length_dynamic,
                 block_info,
                 SeqlenInfoCls,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
                 tile_scheduler=tile_scheduler,
             )
             tmem.relinquish_alloc_permit()
@@ -1242,6 +1254,9 @@ class FlashAttentionMLAForwardSm100:
                 topk_length_dynamic,
                 block_info,
                 SeqlenInfoCls,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
                 tile_scheduler=tile_scheduler,
             )
             tmem_alloc_barrier.arrive()
@@ -1280,6 +1295,146 @@ class FlashAttentionMLAForwardSm100:
             work_tile = tile_scheduler.advance_to_next_work()
 
     @cute.jit
+    def get_n_block_min_max(
+        self,
+        seqlen: SeqlenInfoQK,
+        cluster_m_block: Int32,
+        batch_idx: Int32,
+        topk_length_dynamic: Optional[Int32],
+        block_info: BlockInfo,
+        mCuSeqlensSwa: Optional[cute.Tensor],
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
+        use_dynamic_topk: cutlass.Constexpr[bool],
+    ):
+        if const_expr(self.is_topk_gather):
+            n_block_min = 0
+            if const_expr(use_dynamic_topk):
+                n_block_max = topk_length_dynamic // self.tile_n
+            else:
+                n_block_max = self.topk_length // self.tile_n
+        elif const_expr(self.has_csa_swa):
+            _, swa_block_count, _, comp_block_count = self.get_csa_swa_block_ranges(
+                seqlen,
+                cluster_m_block,
+                batch_idx,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
+            )
+            n_block_min = 0
+            n_block_max = cutlass.max(swa_block_count + comp_block_count, 1)
+        elif const_expr(self.is_causal and not self.has_qk):
+            # Absorbed shared-KV CSA no-SWA path:
+            # q row p sees compressed KV [0, (p + 1) // compress_ratio).
+            q_tile_end = (cluster_m_block + 1) * self.cluster_tile_m
+            if const_expr(self.pack_gqa):
+                q_tile_end = cutlass.min(
+                    q_tile_end,
+                    seqlen.seqlen_q * self.qhead_per_kvhead,
+                )
+                q_tile_end = cute.ceil_div(q_tile_end, self.qhead_per_kvhead)
+            else:
+                q_tile_end = cutlass.min(q_tile_end, seqlen.seqlen_q)
+            max_visible = cutlass.min(q_tile_end // compress_ratio, seqlen.seqlen_k)
+            n_block_min = 0
+            n_block_max = cutlass.max(cute.ceil_div(max_visible, self.tile_n), 1)
+        elif const_expr(self.is_causal):
+            n_block_min = 0
+            n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+        else:
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen,
+                cluster_m_block,
+            )
+        return n_block_min, n_block_max
+
+    @cute.jit
+    def get_csa_swa_block_ranges(
+        self,
+        seqlen: SeqlenInfoQK,
+        cluster_m_block: Int32,
+        batch_idx: Int32,
+        mCuSeqlensSwa: Optional[cute.Tensor],
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
+    ):
+        assert mCuSeqlensSwa is not None, "CSA SWA requires mCuSeqlensSwa"
+        assert swa_window_size is not None, "CSA SWA requires swa_window_size"
+
+        swa_seqlen = mCuSeqlensSwa[batch_idx + 1] - mCuSeqlensSwa[batch_idx]
+        comp_seqlen = seqlen.seqlen_k - swa_seqlen
+        q_tile_start = cluster_m_block * self.cluster_tile_m
+        if const_expr(self.pack_gqa):
+            q_tile_end_packed = cutlass.min(
+                q_tile_start + self.cluster_tile_m,
+                seqlen.seqlen_q * self.qhead_per_kvhead,
+            )
+            q_tile_start = q_tile_start // self.qhead_per_kvhead
+            q_tile_end = cute.ceil_div(q_tile_end_packed, self.qhead_per_kvhead)
+        else:
+            q_tile_end = cutlass.min(q_tile_start + self.cluster_tile_m, seqlen.seqlen_q)
+
+        q_pos_first = q_tile_start + swa_seqlen - seqlen.seqlen_q
+        q_pos_last = q_tile_end - 1 + swa_seqlen - seqlen.seqlen_q
+        swa_first = cutlass.min(
+            cutlass.max(q_pos_first - swa_window_size + 1, 0),
+            swa_seqlen,
+        )
+        swa_last_exclusive = cutlass.max(cutlass.min(q_pos_last + 1, swa_seqlen), 0)
+
+        has_swa_block = (swa_window_size > 0) and (swa_last_exclusive > swa_first)
+        swa_block_min = swa_first // self.tile_n
+        swa_block_end = cute.ceil_div(swa_last_exclusive, self.tile_n)
+        swa_block_count = 0
+        if has_swa_block:
+            swa_block_count = swa_block_end - swa_block_min
+
+        max_comp_visible = cutlass.min(q_tile_end // compress_ratio, comp_seqlen)
+        comp_block_start = swa_seqlen // self.tile_n
+        comp_block_end = cute.ceil_div(swa_seqlen + max_comp_visible, self.tile_n)
+        if has_swa_block and comp_block_start < swa_block_end:
+            comp_block_start = swa_block_end
+        comp_block_count = 0
+        if max_comp_visible > 0 and comp_block_end > comp_block_start:
+            comp_block_count = comp_block_end - comp_block_start
+
+        return swa_block_min, swa_block_count, comp_block_start, comp_block_count
+
+    @cute.jit
+    def get_physical_n_block(
+        self,
+        n_block: Int32,
+        seqlen: SeqlenInfoQK,
+        cluster_m_block: Int32,
+        batch_idx: Int32,
+        mCuSeqlensSwa: Optional[cute.Tensor],
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
+    ):
+        physical_n_block = n_block
+        if const_expr(self.has_csa_swa):
+            (
+                swa_block_min,
+                swa_block_count,
+                comp_block_start,
+                comp_block_count,
+            ) = self.get_csa_swa_block_ranges(
+                seqlen,
+                cluster_m_block,
+                batch_idx,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
+            )
+            physical_n_block = 0
+            if n_block < swa_block_count:
+                physical_n_block = swa_block_min + n_block
+            elif comp_block_count > 0:
+                physical_n_block = comp_block_start + n_block - swa_block_count
+        return physical_n_block
+
+    @cute.jit
     def relay(
         self,
         pipeline_K: Optional[pipeline.PipelineAsyncUmma],
@@ -1290,6 +1445,9 @@ class FlashAttentionMLAForwardSm100:
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        mCuSeqlensSwa: Optional[cute.Tensor],
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
         tile_scheduler: TileSchedulerProtocol,
     ):
         # ==== Make pipeline states ====
@@ -1312,18 +1470,17 @@ class FlashAttentionMLAForwardSm100:
             cluster_m_block = cta_m_block // self.cta_group_size
 
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
-            elif const_expr(self.is_causal):
-                n_block_min = 0
-                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-            else:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen,
-                    cluster_m_block,
-                )
+            n_block_min, n_block_max = self.get_n_block_min_max(
+                seqlen,
+                cluster_m_block,
+                batch_idx,
+                topk_length_dynamic,
+                block_info,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
+                False,
+            )
             num_n_blocks = n_block_max - n_block_min
 
             # ==== Prologue ====
@@ -1392,6 +1549,9 @@ class FlashAttentionMLAForwardSm100:
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        mCuSeqlensSwa: Optional[cute.Tensor],
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
         tile_scheduler: TileSchedulerProtocol,
         mPageTable: Optional[cute.Tensor] = None,
     ):
@@ -1430,18 +1590,17 @@ class FlashAttentionMLAForwardSm100:
             )
 
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
-            elif const_expr(self.is_causal):
-                n_block_min = 0
-                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-            else:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen,
-                    cluster_m_block,
-                )
+            n_block_min, n_block_max = self.get_n_block_min_max(
+                seqlen,
+                cluster_m_block,
+                batch_idx,
+                topk_length_dynamic,
+                block_info,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
+                False,
+            )
             num_n_blocks = n_block_max - n_block_min
 
             if const_expr(self.is_topk_gather):
@@ -1868,6 +2027,9 @@ class FlashAttentionMLAForwardSm100:
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        mCuSeqlensSwa: Optional[cute.Tensor],
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
         tile_scheduler: TileSchedulerProtocol,
         mPageTable: Optional[cute.Tensor] = None,
     ):
@@ -1897,18 +2059,17 @@ class FlashAttentionMLAForwardSm100:
             )
 
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
-            elif const_expr(self.is_causal):
-                n_block_min = 0
-                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-            else:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen,
-                    cluster_m_block,
-                )
+            n_block_min, n_block_max = self.get_n_block_min_max(
+                seqlen,
+                cluster_m_block,
+                batch_idx,
+                topk_length_dynamic,
+                block_info,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
+                False,
+            )
             num_n_blocks = n_block_max - n_block_min
             even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
             num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
@@ -2062,7 +2223,16 @@ class FlashAttentionMLAForwardSm100:
             if const_expr(self.use_tma_KV):
                 # ==== Prologue ====
                 n_block_first = n_block_max - 1 if n_block_max > 0 else 0
-                block = self._get_block_idx(n_block_first, mPageTable_cur)
+                physical_n_block = self.get_physical_n_block(
+                    n_block_first,
+                    seqlen,
+                    cluster_m_block,
+                    batch_idx,
+                    mCuSeqlensSwa,
+                    swa_window_size,
+                    compress_ratio,
+                )
+                block = self._get_block_idx(physical_n_block, mPageTable_cur)
                 # copy K gmem -> smem
                 if const_expr(self.has_qk):
                     producer_state_K = load_K(producer_state_K, block=block)
@@ -2078,8 +2248,26 @@ class FlashAttentionMLAForwardSm100:
                 for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_stages_S):
                         n_block = n_block_max - 1 - n_block_group * self.num_stages_S - stage
-                        block_next = self._get_block_idx(n_block - 1, mPageTable_cur)
-                        block = self._get_block_idx(n_block, mPageTable_cur)
+                        physical_n_block_next = self.get_physical_n_block(
+                            n_block - 1,
+                            seqlen,
+                            cluster_m_block,
+                            batch_idx,
+                            mCuSeqlensSwa,
+                            swa_window_size,
+                            compress_ratio,
+                        )
+                        physical_n_block = self.get_physical_n_block(
+                            n_block,
+                            seqlen,
+                            cluster_m_block,
+                            batch_idx,
+                            mCuSeqlensSwa,
+                            swa_window_size,
+                            compress_ratio,
+                        )
+                        block_next = self._get_block_idx(physical_n_block_next, mPageTable_cur)
+                        block = self._get_block_idx(physical_n_block, mPageTable_cur)
                         if const_expr(self.has_qk):
                             # copy K gmem -> smem
                             producer_state_K = load_K(producer_state_K, block=block_next)
@@ -2095,10 +2283,28 @@ class FlashAttentionMLAForwardSm100:
                 # ==== Epilogue ====
                 num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
                 for stage in cutlass.range(num_final_n_blocks, unroll_full=True):
-                    n_block = num_final_n_blocks - 1 - stage
-                    block = self._get_block_idx(n_block, mPageTable_cur)
-                    if n_block > 0:
-                        block_next = self._get_block_idx(n_block - 1, mPageTable_cur)
+                    n_block = n_block_min + num_final_n_blocks - 1 - stage
+                    physical_n_block = self.get_physical_n_block(
+                        n_block,
+                        seqlen,
+                        cluster_m_block,
+                        batch_idx,
+                        mCuSeqlensSwa,
+                        swa_window_size,
+                        compress_ratio,
+                    )
+                    block = self._get_block_idx(physical_n_block, mPageTable_cur)
+                    if n_block > n_block_min:
+                        physical_n_block_next = self.get_physical_n_block(
+                            n_block - 1,
+                            seqlen,
+                            cluster_m_block,
+                            batch_idx,
+                            mCuSeqlensSwa,
+                            swa_window_size,
+                            compress_ratio,
+                        )
+                        block_next = self._get_block_idx(physical_n_block_next, mPageTable_cur)
                         if const_expr(self.has_qk):
                             # copy K gmem -> smem
                             producer_state_K = load_K(producer_state_K, block=block_next)
@@ -2186,6 +2392,9 @@ class FlashAttentionMLAForwardSm100:
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        mCuSeqlensSwa: Optional[cute.Tensor],
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
         tile_scheduler: TileSchedulerProtocol,
     ):
         # ==== mma warp ====
@@ -2306,18 +2515,17 @@ class FlashAttentionMLAForwardSm100:
             cluster_m_block = cta_m_block // self.cta_group_size
 
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                # n_block_max = self.topk_length // self.tile_n
-                n_block_max = topk_length_dynamic // self.tile_n
-            elif const_expr(self.is_causal):
-                n_block_min = 0
-                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-            else:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen,
-                    cluster_m_block,
-                )
+            n_block_min, n_block_max = self.get_n_block_min_max(
+                seqlen,
+                cluster_m_block,
+                batch_idx,
+                topk_length_dynamic,
+                block_info,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
+                True,
+            )
             num_n_blocks = n_block_max - n_block_min
             even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
             num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
@@ -2582,18 +2790,17 @@ class FlashAttentionMLAForwardSm100:
             if const_expr(self.has_csa_swa):
                 assert mCuSeqlensSwa is not None, "CSA SWA requires mCuSeqlensSwa"
                 swa_seqlen = mCuSeqlensSwa[batch_idx + 1] - mCuSeqlensSwa[batch_idx]
-            if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
-            elif const_expr(self.is_causal):
-                n_block_min = 0
-                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-            else:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen,
-                    cluster_m_block,
-                )
+            n_block_min, n_block_max = self.get_n_block_min_max(
+                seqlen,
+                cluster_m_block,
+                batch_idx,
+                topk_length_dynamic,
+                block_info,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
+                False,
+            )
             num_n_blocks = n_block_max - n_block_min
             even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
             num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
@@ -2674,6 +2881,15 @@ class FlashAttentionMLAForwardSm100:
 
             ### first iteration ###
             n_block = n_block_max - 1
+            physical_n_block = self.get_physical_n_block(
+                n_block,
+                seqlen,
+                cluster_m_block,
+                batch_idx,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
+            )
             (
                 consumer_state_S,
                 producer_state_P,
@@ -2685,7 +2901,7 @@ class FlashAttentionMLAForwardSm100:
                 producer_state_sm_stats,
                 consumer_state_bitmask,
                 0,
-                n_block,
+                physical_n_block,
                 mask_fn=partial(mask_fn, mask_seqlen=True)
                 if not const_expr(disable_mask)
                 else None,
@@ -2706,6 +2922,15 @@ class FlashAttentionMLAForwardSm100:
                 num_n_block_groups -= num_masked_n_block_groups
                 for _ in cutlass.range(num_masked_n_block_groups, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_stages_S):
+                        physical_n_block = self.get_physical_n_block(
+                            n_block,
+                            seqlen,
+                            cluster_m_block,
+                            batch_idx,
+                            mCuSeqlensSwa,
+                            swa_window_size,
+                            compress_ratio,
+                        )
                         (
                             consumer_state_S,
                             producer_state_P,
@@ -2717,7 +2942,7 @@ class FlashAttentionMLAForwardSm100:
                             producer_state_sm_stats,
                             consumer_state_bitmask,
                             1 - stage,
-                            n_block,
+                            physical_n_block,
                             mask_fn=partial(mask_fn, mask_seqlen=False),
                         )
                         n_block -= 1
@@ -2725,6 +2950,15 @@ class FlashAttentionMLAForwardSm100:
             ### Mainloop ###
             for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
                 for stage in cutlass.range_constexpr(self.num_stages_S):
+                    physical_n_block = self.get_physical_n_block(
+                        n_block,
+                        seqlen,
+                        cluster_m_block,
+                        batch_idx,
+                        mCuSeqlensSwa,
+                        swa_window_size,
+                        compress_ratio,
+                    )
                     (
                         consumer_state_S,
                         producer_state_P,
@@ -2736,7 +2970,7 @@ class FlashAttentionMLAForwardSm100:
                         producer_state_sm_stats,
                         consumer_state_bitmask,
                         1 - stage,
-                        n_block,
+                        physical_n_block,
                         mask_fn=partial(mask_fn, mask_seqlen=False)
                         if const_expr(
                             self.is_causal
@@ -2751,6 +2985,15 @@ class FlashAttentionMLAForwardSm100:
             ### last iteration if even ###
             # always mask to simplify logic
             if even_n_blocks:
+                physical_n_block = self.get_physical_n_block(
+                    n_block,
+                    seqlen,
+                    cluster_m_block,
+                    batch_idx,
+                    mCuSeqlensSwa,
+                    swa_window_size,
+                    compress_ratio,
+                )
                 (
                     consumer_state_S,
                     producer_state_P,
@@ -2762,7 +3005,7 @@ class FlashAttentionMLAForwardSm100:
                     producer_state_sm_stats,
                     consumer_state_bitmask,
                     1,
-                    n_block,
+                    physical_n_block,
                     mask_fn=partial(mask_fn, mask_seqlen=False)
                     if not const_expr(disable_mask)
                     else None,
@@ -2916,6 +3159,9 @@ class FlashAttentionMLAForwardSm100:
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        mCuSeqlensSwa: Optional[cute.Tensor],
+        swa_window_size: Optional[Int32],
+        compress_ratio: Int32,
         tile_scheduler: TileSchedulerProtocol,
     ):
         ### ==== correction/epilogue warpgroup ====
@@ -2984,18 +3230,17 @@ class FlashAttentionMLAForwardSm100:
             cluster_m_block = cta_m_block // self.cta_group_size
 
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(self.is_topk_gather):
-                n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
-            elif const_expr(self.is_causal):
-                n_block_min = 0
-                n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-            else:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen,
-                    cluster_m_block,
-                )
+            n_block_min, n_block_max = self.get_n_block_min_max(
+                seqlen,
+                cluster_m_block,
+                batch_idx,
+                topk_length_dynamic,
+                block_info,
+                mCuSeqlensSwa,
+                swa_window_size,
+                compress_ratio,
+                False,
+            )
             num_n_blocks = n_block_max - n_block_min
 
             consumer_states_O = [consumer_state_O0, consumer_state_O1]
