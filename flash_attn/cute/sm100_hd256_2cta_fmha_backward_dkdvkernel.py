@@ -96,50 +96,62 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
     def __init__(
         self,
         acc_dtype: type[cutlass.Numeric],
-        cta_tiler: tuple[int, int, int],
+        cta_tiler: tuple[int, int, int] | tuple[int, int, int, int] | tuple[int, int, int, int, int],
         is_causal: bool,
         window_size_left: int | None,
         window_size_right: int | None,
         use_clc_scheduler: bool = False,
+        csa_compress_ratio: int = 0,
     ):
         """Initialization."""
         self.acc_dtype = acc_dtype
         self.cta_tiler = cta_tiler
         self.use_clc_scheduler = use_clc_scheduler
         self.sched_warp_id = 10 if use_clc_scheduler else None
+        self.csa_compress_ratio = csa_compress_ratio
+        self.has_csa_compression = csa_compress_ratio > 0
         # TODO: need check, not sure whether need to *2 if 2cta
         self.tile_shape_Q = cta_tiler[0]
         self.tile_shape_K = cta_tiler[1]
-        self.tile_shape_dQ_K = cta_tiler[2]
-        self.tile_shape_dV_dO = cta_tiler[2]
+        self.tile_shape_QK = cta_tiler[2]
+        self.tile_shape_dQ_K = cta_tiler[3] if len(cta_tiler) > 4 else cta_tiler[2]
+        self.tile_shape_dV_dO = (
+            cta_tiler[4]
+            if len(cta_tiler) > 4
+            else cta_tiler[3]
+            if len(cta_tiler) > 3
+            else cta_tiler[2]
+        )
+        self.tile_shape_dP_dO = cta_tiler[5] if len(cta_tiler) > 5 else self.tile_shape_dV_dO
+        self.reuse_k_as_v = len(cta_tiler) > 5 and self.tile_shape_dP_dO == self.tile_shape_QK
         # For S
         self.KQ_mma_tiler = (
             cta_tiler[1] * 2,
             cta_tiler[0],
-            cta_tiler[2],
+            self.tile_shape_QK,
         )
         # For dP
         self.VdO_mma_tiler = (
             cta_tiler[1] * 2,
             cta_tiler[0],
-            cta_tiler[2],
+            self.tile_shape_dP_dO,
         )
         # For dV
         self.PdO_mma_tiler = (
             cta_tiler[1] * 2,
-            cta_tiler[2],
+            self.tile_shape_dV_dO,
             cta_tiler[0],
         )
         # For dK
         self.dSQ_mma_tiler = (
             cta_tiler[1] * 2,
-            cta_tiler[2],
+            self.tile_shape_dQ_K,
             cta_tiler[0],
         )
         # For dQ, dishengbin, need to remove
         self.dSK_mma_tiler = (
             cta_tiler[0] * 2,
-            cta_tiler[2],
+            self.tile_shape_dQ_K,
             cta_tiler[1],
         )
         self.cluster_shape_mn = (2, 1)
@@ -171,9 +183,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.reduce_sync_bar_id = 4
 
         self.tmem_dK_offset = 0
-        self.tmem_dV_offset = Tmemory_offset(0, cta_tiler[2] // 2)
-        self.tmem_dP_offset = Tmemory_offset(0, cta_tiler[2] + cta_tiler[0] // 2)
-        self.tmem_S_offset = Tmemory_offset(0, cta_tiler[2])
+        self.tmem_dV_offset = Tmemory_offset(0, self.tile_shape_dQ_K // 2)
+        self.tmem_S_offset = Tmemory_offset(
+            0, (self.tile_shape_dQ_K + self.tile_shape_dV_dO) // 2
+        )
+        self.tmem_dP_offset = Tmemory_offset(
+            0, (self.tile_shape_dQ_K + self.tile_shape_dV_dO) // 2 + cta_tiler[0] // 2
+        )
 
         self.num_regs_reduce = 152
         self.num_regs_compute = 128
@@ -216,10 +232,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         cumulative_s_q: cute.Tensor | None,
         cumulative_s_k: cute.Tensor | None,
         scale_softmax: cutlass.Float32,
+        dO_for_dV: cute.Tensor,
         stream: cuda.CUstream,
+        Q_dK: cute.Tensor | None = None,
     ):
         """Host function to launch CuTeDSL kernel."""
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
+        Q_for_dK = Q if cutlass.const_expr(Q_dK is None) else Q_dK
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D).
         h_r = Q.shape[3]
         h_k = Q.shape[2]
@@ -247,6 +266,20 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     (
                         (Q.stride[3], Q.stride[2]),
                         0 if cumulative_s_q is not None else cute.assume(Q.stride[0], divby=64),
+                    ),
+                ),
+            ),
+        )
+        Q_for_dK = cute.make_tensor(
+            Q_for_dK.iterator,
+            cute.make_layout(
+                (Q_for_dK.shape[1], Q_for_dK.shape[4], hb),
+                stride=(
+                    cute.assume(Q_for_dK.stride[1], divby=64),
+                    Q_for_dK.stride[4],
+                    (
+                        (Q_for_dK.stride[3], Q_for_dK.stride[2]),
+                        0 if cumulative_s_q is not None else cute.assume(Q_for_dK.stride[0], divby=64),
                     ),
                 ),
             ),
@@ -283,13 +316,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
         # (s, d, ((h_r, h_k), b)) -> (d, s, ((h_r, h_k), b))
         QT = cute.make_tensor(
-            Q.iterator,
+            Q_for_dK.iterator,
             cute.make_layout(
-                (Q.shape[1], Q.shape[0], Q.shape[2]),
+                (Q_for_dK.shape[1], Q_for_dK.shape[0], Q_for_dK.shape[2]),
                 stride=(
-                    Q.stride[1],
-                    Q.stride[0],
-                    Q.stride[2],
+                    Q_for_dK.stride[1],
+                    Q_for_dK.stride[0],
+                    Q_for_dK.stride[2],
                 ),
             ),
         )
@@ -336,16 +369,30 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 ),
             ),
         )
+        dO_for_dV = cute.make_tensor(
+            dO_for_dV.iterator,
+            cute.make_layout(
+                (dO_for_dV.shape[1], dO_for_dV.shape[4], hb),
+                stride=(
+                    cute.assume(dO_for_dV.stride[1], divby=64),
+                    dO_for_dV.stride[4],
+                    (
+                        (dO_for_dV.stride[3], dO_for_dV.stride[2]),
+                        0 if cumulative_s_q is not None else cute.assume(dO_for_dV.stride[0], divby=64),
+                    ),
+                ),
+            ),
+        )
 
         # (s, d, ((h_r, h_k), b)) -> (d, s, ((h_r, h_k), b))
         dOT = cute.make_tensor(
-            dO.iterator,
+            dO_for_dV.iterator,
             cute.make_layout(
-                (dO.shape[1], dO.shape[0], dO.shape[2]),
+                (dO_for_dV.shape[1], dO_for_dV.shape[0], dO_for_dV.shape[2]),
                 stride=(
-                    dO.stride[1],
-                    dO.stride[0],
-                    dO.stride[2],
+                    dO_for_dV.stride[1],
+                    dO_for_dV.stride[0],
+                    dO_for_dV.stride[2],
                 ),
             ),
         )
@@ -581,8 +628,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # for 2cta, tma_copy_QT_bytes is same as the tma_copy_Q_bytes
         self.tma_copy_Q_bytes = cute.size_in_bytes(Q.element_type, Q_smem_layout) * atom_thr_size
         self.tma_copy_K_bytes = cute.size_in_bytes(K.element_type, K_smem_layout) * atom_thr_size
-        self.tma_copy_V_bytes = cute.size_in_bytes(V.element_type, V_smem_layout) * atom_thr_size
+        self.tma_copy_V_bytes = (
+            0
+            if cutlass.const_expr(self.reuse_k_as_v)
+            else cute.size_in_bytes(V.element_type, V_smem_layout) * atom_thr_size
+        )
         self.tma_copy_dO_bytes = cute.size_in_bytes(dO.element_type, dO_smem_layout) * atom_thr_size
+        self.tma_copy_dOT_bytes = cute.size_in_bytes(dO_for_dV.element_type, dOT_smem_layout) * atom_thr_size
 
         # Variant 3a epilogue: TMA store atoms (S2G) for dK / dV.
         # Each compute warp group owns half the hd_v output via split_wg, so
@@ -596,38 +648,45 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # = 4 stages of (64, 64), virtually a per-CTA (64, 256) buffer aliased onto
         # sP+sdST. Both warp-groups cooperatively populate this buffer; TMA fires
         # one (64, 64) box per stage to the corresponding (64, 64) GMEM slice.
-        epi_cols_dKV = math.gcd(
-            128 // (dK.element_type.width // 8), self.cta_tiler[2] // num_compute_wgs
+        epi_cols_dK = math.gcd(
+            128 // (dK.element_type.width // 8), self.tile_shape_dQ_K // num_compute_wgs
         )
-        num_epi_stages_dKV = (self.cta_tiler[2] // num_compute_wgs) // epi_cols_dKV
-        epi_tile_dKV = (self.cta_tiler[1], epi_cols_dKV)
-        total_epi_stages = num_compute_wgs * num_epi_stages_dKV
+        num_epi_stages_dK = (self.tile_shape_dQ_K // num_compute_wgs) // epi_cols_dK
+        epi_tile_dK = (self.cta_tiler[1], epi_cols_dK)
+        total_epi_stages_dK = num_compute_wgs * num_epi_stages_dK
+        epi_cols_dV = math.gcd(
+            128 // (dV.element_type.width // 8), self.tile_shape_dV_dO // num_compute_wgs
+        )
+        num_epi_stages_dV = (self.tile_shape_dV_dO // num_compute_wgs) // epi_cols_dV
+        epi_tile_dV = (self.cta_tiler[1], epi_cols_dV)
+        total_epi_stages_dV = num_compute_wgs * num_epi_stages_dV
         dK_layout_enum = utils.LayoutEnum.from_tensor(dK)
         dV_layout_enum = utils.LayoutEnum.from_tensor(dV)
         sdK_epi_layout = sm100_utils.make_smem_layout_epi(
             dK.element_type,
             dK_layout_enum,
-            epi_tile_dKV,
-            total_epi_stages,
+            epi_tile_dK,
+            total_epi_stages_dK,
         )
         sdV_epi_layout = sm100_utils.make_smem_layout_epi(
             dV.element_type,
             dV_layout_enum,
-            epi_tile_dKV,
-            total_epi_stages,
+            epi_tile_dV,
+            total_epi_stages_dV,
         )
         tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
             tma_store_op,
             dK,
             cute.select(sdK_epi_layout, mode=[0, 1]),
-            epi_tile_dKV,
+            epi_tile_dK,
         )
         tma_atom_dV, tma_tensor_dV = cpasync.make_tiled_tma_atom(
             tma_store_op,
             dV,
             cute.select(sdV_epi_layout, mode=[0, 1]),
-            epi_tile_dKV,
+            epi_tile_dV,
         )
+        sP_storage_elems = max(cute.cosize(P_smem_layout_staged), cute.cosize(sdK_epi_layout))
 
         @cute.struct
         class SharedStorage:
@@ -670,7 +729,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             ]
             # only used in 2cta
             sV: cute.struct.Align[
-                cute.struct.MemRange[V.element_type, cute.cosize(V_smem_layout_staged)],
+                cute.struct.MemRange[
+                    V.element_type,
+                    1 if cutlass.const_expr(self.reuse_k_as_v) else cute.cosize(V_smem_layout_staged),
+                ],
                 self.buffer_align_bytes,
             ]
             sQ: cute.struct.Align[
@@ -692,7 +754,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             # only used in 2cta
             # dishengbin checked whether we need sP
             sP: cute.struct.Align[
-                cute.struct.MemRange[Q.element_type, cute.cosize(P_smem_layout_staged)],
+                cute.struct.MemRange[Q.element_type, sP_storage_elems],
                 self.buffer_align_bytes,
             ]
             sdST: cute.struct.Align[
@@ -905,7 +967,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             num_stages=self.load_mma_dO_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            tx_count=self.tma_copy_dO_bytes,
+            tx_count=self.tma_copy_dOT_bytes,
             barrier_storage=storage.load_mma_dOT_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
@@ -984,7 +1046,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # setup mma
         sQ = storage.sQ.get_tensor(Q_smem_layout_staged.outer, swizzle=Q_smem_layout_staged.inner)
         sK = storage.sK.get_tensor(K_smem_layout_staged.outer, swizzle=K_smem_layout_staged.inner)
-        sV = storage.sV.get_tensor(V_smem_layout_staged.outer, swizzle=V_smem_layout_staged.inner)
+        if cutlass.const_expr(self.reuse_k_as_v):
+            sV = storage.sK.get_tensor(
+                V_smem_layout_staged.outer,
+                swizzle=V_smem_layout_staged.inner,
+            )
+        else:
+            sV = storage.sV.get_tensor(
+                V_smem_layout_staged.outer,
+                swizzle=V_smem_layout_staged.inner,
+            )
         sdO = storage.sdO.get_tensor(
             dO_smem_layout_staged.outer, swizzle=dO_smem_layout_staged.inner
         )
@@ -1064,7 +1135,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             clc_response_ptr = storage.clc_response.data_ptr()
             clc = ClcState.create(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
-                    self.tile_sched_params.clc_hw_params(),
+                    tile_sched_params.clc_hw_params(),
                     cute.arch.block_idx(),
                     cute.arch.grid_dim(),
                     clc_response_ptr,
@@ -1718,6 +1789,18 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         """Get Q tiles range."""
         Q_block_max = cute.ceil_div(seq_Q, self.tile_shape_Q)
         Q_block_min = cutlass.Int32(0)
+        if cutlass.const_expr(self.has_csa_compression):
+            # CSA compressed attention keeps kv < floor((q + 1) / ratio).  For
+            # the two-CTA K tile, both CTAs must run the same Q loop count, so
+            # derive the lower bound from the first K block in the cluster.
+            blk_coord_k_for_min = (blk_coord_k // 2) * 2
+            first_visible_q = (
+                (blk_coord_k_for_min * self.tile_shape_K + 1) * self.csa_compress_ratio
+                - 1
+            )
+            Q_block_min_tmp = first_visible_q // self.tile_shape_Q
+            Q_block_min_tmp = Q_block_min_tmp - Q_block_min_tmp % 2
+            Q_block_min = max(Q_block_min_tmp, Q_block_min)
         if cutlass.const_expr(self.has_sliding_window):
             # For 2cta, use the last K block in the cluster so both CTAs get the same Q_block_max
             blk_coord_k_for_max = (blk_coord_k // 2) * 2 + 1
@@ -1944,12 +2027,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         lse_handle.commit()
 
         v_handle = load_mma_V_producer.acquire_and_advance()
-        cute.copy(
-            tma_atom_V,
-            tVgV_mkl[(None, mma_tile_coord_m, 0, (blk_coord_h, blk_coord_b))],
-            tVsV[(None, 0)],
-            tma_bar_ptr=v_handle.barrier,
-        )
+        if cutlass.const_expr(not self.reuse_k_as_v):
+            cute.copy(
+                tma_atom_V,
+                tVgV_mkl[(None, mma_tile_coord_m, 0, (blk_coord_h, blk_coord_b))],
+                tVsV[(None, 0)],
+                tma_bar_ptr=v_handle.barrier,
+            )
 
         do_handle = load_mma_dO_producer.acquire_and_advance()
         cute.copy(
@@ -2338,36 +2422,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
         smem_slice_tmp = cute.composition(smem_slice, thread_layout)
 
-        # TODO: temporary code for tile 64 x 64.
-        tmp_shape = ((8, 2, 4), (2, 4, 2, 2, 2))
-        tmp_stride = ((64, 512, 1024), (1, 2, 8, 16, 32))
-        smem_copy = cute.composition(smem_slice_tmp, cute.make_layout(tmp_shape, stride=tmp_stride))
+        # tcgen05.ld.32x32b.x16 returns one 16-element vector per thread for
+        # the 64x64 tile. Across 2 WGs x 4 warps x 32 lanes this covers the
+        # whole 64x64 staging tile.
+        tmp_shape = ((32, 2), (16, 2, 2))
+        tmp_stride = ((64, 32 * 64), (1, 16, 32))
+        smem_copy = cute.make_tensor(
+            smem_slice_tmp.iterator, cute.make_layout(tmp_shape, stride=tmp_stride)
+        )
 
-        # TODO: the following code is only for tile 64 x 64.
-        # TODO: need to modify the code for other tile sizes.
+        warp_idx = dp_idx // 32
+        warp_row_idx = warp_idx % 2
+        warp_col_idx = warp_idx // 2
         lane_idx = dp_idx % 32
-        reg_shape = regs.shape
-        atom_loops = reg_shape[0][0][2]
-        block_loops = reg_shape[2]
-        # | 00 ~ 07 | 08 ~ 15 | 16 ~ 23 | 24 ~ 31 | 32 ~ 39 | 40 ~ 47 | 48 ~ 55 | 56 ~ 63 |
-        # |---- atom size ----|---- atom size ----|---- atom size ----|---- atom size ----|
-        # |----     wg0   ----|----     wg1   ----|----     wg0   ----|----     wg1   ----|
-        for ia in cutlass.range(atom_loops):
-            for ib in cutlass.range(block_loops):
-                # the lower 8 lines
-                regs_copy = regs[((None, 0, ia), 0), 0, ib]  # two elements
-                smem_copy_slice = smem_copy[
-                    (lane_idx // 4, 0, dp_idx // 32),
-                    (None, lane_idx % 4, ia, wg_idx, ib),
-                ]
-                cute.autovec_copy(regs_copy, smem_copy_slice)
-                # the upper 8 lines
-                regs_copy = regs[((None, 1, ia), 0), 0, ib]
-                smem_copy_slice = smem_copy[
-                    (lane_idx // 4, 1, dp_idx // 32),
-                    (None, lane_idx % 4, ia, wg_idx, ib),
-                ]
-                cute.autovec_copy(regs_copy, smem_copy_slice)
+        regs_copy = regs[(None, 0), 0, 0]
+        smem_copy_slice = smem_copy[(lane_idx, warp_row_idx), (None, wg_idx, warp_col_idx)]
+        cute.autovec_copy(regs_copy, smem_copy_slice)
 
     @cute.jit
     def reg_to_smem_mma128x128_2cta(
@@ -2582,6 +2652,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 leading_causal_masking
                 or trailing_residual_masking
                 or self.has_sliding_window
+                or self.has_csa_compression
                 or cutlass.const_expr(self.is_causal)
             )
 
@@ -2595,6 +2666,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         cute.get(c_transpose, mode=[1]) + iter_index * self.tile_shape_Q,
                         cute.get(c_transpose, mode=[0]) + blk_coord_k * self.tile_shape_K,
                     )
+                    if cutlass.const_expr(self.has_csa_compression):
+                        tTR_rST[i] = (
+                            -cutlass.Float32.inf
+                            if pos[1] >= ((pos[0] + 1) // self.csa_compress_ratio)
+                            else tTR_rST[i]
+                        )
                     if cutlass.const_expr(self.has_sliding_window):
                         if cutlass.const_expr(self.window_size_left < 0):
                             tTR_rST[i] = (
@@ -2641,14 +2718,24 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             # convert fp32 P to fp16 P which will be used in the PdO
             tTR_rPT = self.quantize(tTR_rST, dV.element_type)  # tTR_rST is ST in fp32 in RF.
-            self.reg_to_smem_mma128x128_2cta(
-                tTR_rPT,
-                sP,
-                p_handle.index,
-                (self.tile_shape_K, self.tile_shape_Q),
-                dp_idx,
-                wg_idx,
-            )
+            if cutlass.const_expr(self.tile_shape_K == 64 and self.tile_shape_Q == 64):
+                self.reg_to_smem_mma64x64(
+                    tTR_rPT,
+                    sP,
+                    p_handle.index,
+                    (self.tile_shape_K, self.tile_shape_Q),
+                    dp_idx,
+                    wg_idx,
+                )
+            else:
+                self.reg_to_smem_mma128x128_2cta(
+                    tTR_rPT,
+                    sP,
+                    p_handle.index,
+                    (self.tile_shape_K, self.tile_shape_Q),
+                    dp_idx,
+                    wg_idx,
+                )
             cute.arch.fence_view_async_shared()
             cute.arch.barrier(
                 barrier_id=self.compute_sync_bar_id,
@@ -2688,15 +2775,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tTR_rdPT[i], tTR_rdPT[i + 1] = cute.arch.mul_packed_f32x2(
                     (tTR_rdPT[i], tTR_rdPT[i + 1]), (tTR_rST[i], tTR_rST[i + 1])
                 )
-            # For causal, force dS to zero at masked (q,k) so dK/dV accumulation is correct
-            if cutlass.const_expr(self.is_causal):
+            # For masked layouts, force dS to zero at invalid (q,k) so dK accumulation is correct.
+            if cutlass.const_expr(self.is_causal or self.has_csa_compression):
                 for i in cutlass.range(cute.size(tTR_rdPT), unroll_full=True):
                     c_transpose = tTR_cdPT[i]
                     pos = (
                         cute.get(c_transpose, mode=[1]) + iter_index * self.tile_shape_Q,
                         cute.get(c_transpose, mode=[0]) + blk_coord_k * self.tile_shape_K,
                     )
-                    if pos[0] + K - Q < pos[1] or not cute.elem_less(pos, (Q, K)):
+                    should_zero = not cute.elem_less(pos, (Q, K))
+                    if cutlass.const_expr(self.is_causal):
+                        should_zero = should_zero or (pos[0] + K - Q < pos[1])
+                    if cutlass.const_expr(self.has_csa_compression):
+                        should_zero = should_zero or (
+                            pos[1] >= ((pos[0] + 1) // self.csa_compress_ratio)
+                        )
+                    if should_zero:
                         tTR_rdPT[i] = cutlass.Float32(0.0)
             # convert fp32 dS to fp16 dS which will be used in the computation of dK and DQ
             tTR_rdST = self.quantize(tTR_rdPT, dV.element_type)
@@ -2704,14 +2798,24 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cute.arch.fence_view_async_tmem_load()
             dp_handle.release()
 
-            self.reg_to_smem_mma128x128_2cta(
-                tTR_rdST,
-                sdST,
-                ds_handle.index,
-                (self.tile_shape_K, self.tile_shape_Q),
-                dp_idx,
-                wg_idx,
-            )
+            if cutlass.const_expr(self.tile_shape_K == 64 and self.tile_shape_Q == 64):
+                self.reg_to_smem_mma64x64(
+                    tTR_rdST,
+                    sdST,
+                    ds_handle.index,
+                    (self.tile_shape_K, self.tile_shape_Q),
+                    dp_idx,
+                    wg_idx,
+                )
+            else:
+                self.reg_to_smem_mma128x128_2cta(
+                    tTR_rdST,
+                    sdST,
+                    ds_handle.index,
+                    (self.tile_shape_K, self.tile_shape_Q),
+                    dp_idx,
+                    wg_idx,
+                )
             cute.arch.fence_view_async_shared()
             cute.arch.barrier(
                 barrier_id=self.compute_sync_bar_id,
@@ -2812,11 +2916,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dK.iterator + mdK_offset,
             cute.make_layout((K, self.tile_shape_dQ_K, HB), stride=dK.stride),
         )
-        gdK = cute.local_tile(mdK, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
+        gdK = cute.local_tile(
+            mdK, (self.tile_shape_K, self.tile_shape_dQ_K), (None, None, None)
+        )
         gdK = gdK[None, None, blk_coord_k, 0, blk_coord_batch]
         cdK = cute.domain_offset(
             (blk_coord_k * self.tile_shape_K, 0),
-            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
+            cute.make_identity_tensor((self.tile_shape_K, self.tile_shape_dQ_K)),
         )
 
         mdV_offset = cute.assume(blk_offset[1] * dV.stride[0], divby=64)
@@ -2824,41 +2930,45 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dV.iterator + mdV_offset,
             cute.make_layout((K, self.tile_shape_dV_dO, HB), stride=dV.stride),
         )
-        gdV = cute.local_tile(mdV, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
+        gdV = cute.local_tile(
+            mdV, (self.tile_shape_K, self.tile_shape_dV_dO), (None, None, None)
+        )
         gdV = gdV[None, None, blk_coord_k, 0, blk_coord_batch]
         cdV = cute.domain_offset(
             (blk_coord_k * self.tile_shape_K, 0),
-            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
+            cute.make_identity_tensor((self.tile_shape_K, self.tile_shape_dV_dO)),
         )
 
         num_zero_epi_threads = 256
 
-        tiled_copy_r2g = fa_copy_utils.tiled_copy_2d(
-            dK.element_type, self.cta_tiler[2], num_zero_epi_threads
+        tiled_copy_r2g_dK = fa_copy_utils.tiled_copy_2d(
+            dK.element_type, self.tile_shape_dQ_K, num_zero_epi_threads
+        )
+        tiled_copy_r2g_dV = fa_copy_utils.tiled_copy_2d(
+            dV.element_type, self.tile_shape_dV_dO, num_zero_epi_threads
         )
 
-        thr_copy_r2g = tiled_copy_r2g.get_slice(tidx)
+        thr_copy_r2g_dK = tiled_copy_r2g_dK.get_slice(tidx)
+        thr_copy_r2g_dV = tiled_copy_r2g_dV.get_slice(tidx)
 
-        tRG_gdK = thr_copy_r2g.partition_D(gdK)
-        tRG_cdK = thr_copy_r2g.partition_D(cdK)
-        tRG_gdV = thr_copy_r2g.partition_D(gdV)
-        tRG_cdV = thr_copy_r2g.partition_D(cdV)
+        tRG_gdK = thr_copy_r2g_dK.partition_D(gdK)
+        tRG_cdK = thr_copy_r2g_dK.partition_D(cdK)
+        tRG_gdV = thr_copy_r2g_dV.partition_D(gdV)
+        tRG_cdV = thr_copy_r2g_dV.partition_D(cdV)
 
         zero_frg = cute.make_rmem_tensor_like(tRG_gdK[None, 0, None])
         zero_frg.fill(dK.element_type(0.0))
-
-        # check we don't need zero fragment duplication
-        V_frg_size = cute.size(tRG_gdV[None, 0, None])
-        assert cute.size(zero_frg) == V_frg_size
+        zero_frg_v = cute.make_rmem_tensor_like(tRG_gdV[None, 0, None])
+        zero_frg_v.fill(dV.element_type(0.0))
 
         if tidx < num_zero_epi_threads:
             for n in cutlass.range(cute.size(tRG_gdK.shape[1]), unroll_full=True):
                 if cute.elem_less(tRG_cdK[0, n, 0][0], problem_shape[1]):
-                    cute.copy(tiled_copy_r2g, zero_frg, tRG_gdK[None, n, None])
+                    cute.copy(tiled_copy_r2g_dK, zero_frg, tRG_gdK[None, n, None])
 
             for n in cutlass.range(cute.size(tRG_gdV.shape[1]), unroll_full=True):
                 if cute.elem_less(tRG_cdV[0, n, 0][0], problem_shape[1]):
-                    cute.copy(tiled_copy_r2g, zero_frg, tRG_gdV[None, n, None])
+                    cute.copy(tiled_copy_r2g_dV, zero_frg_v, tRG_gdV[None, n, None])
 
     @cute.jit
     def epilogue(
@@ -2913,11 +3023,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dK.iterator + mdK_offset,
             cute.make_layout((K, self.tile_shape_dQ_K, HB), stride=dK.stride),
         )
-        gdK = cute.local_tile(mdK, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
+        gdK = cute.local_tile(
+            mdK, (self.tile_shape_K, self.tile_shape_dQ_K), (None, None, None)
+        )
         gdK = gdK[None, None, blk_coord_k, 0, blk_coord_batch]
         cdK = cute.domain_offset(
             (blk_coord_k * self.tile_shape_K, 0),
-            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
+            cute.make_identity_tensor((self.tile_shape_K, self.tile_shape_dQ_K)),
         )
 
         num_warp_groups = self.num_compute_warps // 4
@@ -2938,18 +3050,24 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
 
         # Compile-time: stage tile shape and number of stages.
-        epi_cols_dKV = math.gcd(
-            128 // (dV.element_type.width // 8), self.cta_tiler[2] // num_warp_groups
+        epi_cols_dK = math.gcd(
+            128 // (dK.element_type.width // 8), self.tile_shape_dQ_K // num_warp_groups
         )
-        num_epi_stages_dKV = (self.cta_tiler[2] // num_warp_groups) // epi_cols_dKV
-        total_epi_stages = num_warp_groups * num_epi_stages_dKV
-        epi_tile_dKV = (self.cta_tiler[1], epi_cols_dKV)
+        num_epi_stages_dK = (self.tile_shape_dQ_K // num_warp_groups) // epi_cols_dK
+        total_epi_stages_dK = num_warp_groups * num_epi_stages_dK
+        epi_tile_dK = (self.tile_shape_K, epi_cols_dK)
+        epi_cols_dV = math.gcd(
+            128 // (dV.element_type.width // 8), self.tile_shape_dV_dO // num_warp_groups
+        )
+        num_epi_stages_dV = (self.tile_shape_dV_dO // num_warp_groups) // epi_cols_dV
+        total_epi_stages_dV = num_warp_groups * num_epi_stages_dV
+        epi_tile_dV = (self.tile_shape_K, epi_cols_dV)
 
         # Local (M, N) coord tensor for SMEM indexing (no global domain offset
         # — cdK/cdV are domain-offset by blk_coord_k * tile_shape_K to match
         # the GMEM destination, but the SMEM indexing must be per-CTA-local).
-        cdV_local = cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2]))
-        cdK_local = cdV_local
+        cdV_local = cute.make_identity_tensor((self.tile_shape_K, self.tile_shape_dV_dO))
+        cdK_local = cute.make_identity_tensor((self.tile_shape_K, self.tile_shape_dQ_K))
 
         tiled_t2r_dK = tcgen05.make_tmem_copy(load_op, tdKtdK)
         thread_t2r_dK = tiled_t2r_dK.get_slice(dp_idx)
@@ -2965,16 +3083,18 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tTR_tdK = split_wg(tTR_tdK, num_warp_groups, wg_idx)
 
         mdV_in = cute.make_tensor(
-            dV.iterator, cute.make_layout((K, self.cta_tiler[2], HB), stride=dV.stride)
+            dV.iterator, cute.make_layout((K, self.tile_shape_dV_dO, HB), stride=dV.stride)
         )
         offset_mdV = cute.assume(blk_offset[1] * mdV_in.stride[0], divby=64)
         mdV = cute.make_tensor(mdV_in.iterator + offset_mdV, mdV_in.layout)
-        gdV = cute.local_tile(mdV, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
+        gdV = cute.local_tile(
+            mdV, (self.tile_shape_K, self.tile_shape_dV_dO), (None, None, None)
+        )
         gdV = gdV[None, None, blk_coord_k, 0, blk_coord_batch]
 
         cdV = cute.domain_offset(
-            (blk_coord_k * self.cta_tiler[1], 0),
-            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
+            (blk_coord_k * self.tile_shape_K, 0),
+            cute.make_identity_tensor((self.tile_shape_K, self.tile_shape_dV_dO)),
         )
 
         tdVtdV = tdVtdV[(None, None), 0, 0]
@@ -2996,23 +3116,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         if cutlass.const_expr(not varlen):
             mdV_tma_3d = cute.make_tensor(
                 dV_tma.iterator,
-                cute.make_layout((K, self.cta_tiler[2], HB), stride=dV_tma.stride),
+                cute.make_layout((K, self.tile_shape_dV_dO, HB), stride=dV_tma.stride),
             )
             mdV_tma_cur = mdV_tma_3d[None, None, blk_coord_batch]
             gdV_tma = cute.local_tile(
-                mdV_tma_cur, (self.cta_tiler[1], self.cta_tiler[2]), (blk_coord_k, 0)
+                mdV_tma_cur, (self.tile_shape_K, self.tile_shape_dV_dO), (blk_coord_k, 0)
             )
-            gdV_tma_epi = cute.local_tile(gdV_tma, epi_tile_dKV, (0, None))
+            gdV_tma_epi = cute.local_tile(gdV_tma, epi_tile_dV, (0, None))
 
             mdK_tma_3d = cute.make_tensor(
                 dK_tma.iterator,
-                cute.make_layout((K, self.cta_tiler[2], HB), stride=dK_tma.stride),
+                cute.make_layout((K, self.tile_shape_dQ_K, HB), stride=dK_tma.stride),
             )
             mdK_tma_cur = mdK_tma_3d[None, None, blk_coord_batch]
             gdK_tma = cute.local_tile(
-                mdK_tma_cur, (self.cta_tiler[1], self.cta_tiler[2]), (blk_coord_k, 0)
+                mdK_tma_cur, (self.tile_shape_K, self.tile_shape_dQ_K), (blk_coord_k, 0)
             )
-            gdK_tma_epi = cute.local_tile(gdK_tma, epi_tile_dKV, (0, None))
+            gdK_tma_epi = cute.local_tile(gdK_tma, epi_tile_dK, (0, None))
 
         cta_threads = self.num_compute_warps * self.threads_per_warp
 
@@ -3033,17 +3153,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         c = tTR_cdV_local[None, 0, _i][_j]
                         m_pos = c[0]
                         n_pos = c[1]
-                        stage_pos = n_pos // epi_cols_dKV
-                        n_within_pos = n_pos % epi_cols_dKV
+                        stage_pos = n_pos // epi_cols_dV
+                        n_within_pos = n_pos % epi_cols_dV
                         v = tTR_rdV_cast[None, 0, _i][_j]
-                        s_epi_dV[m_pos, n_within_pos, stage_pos] = v
+                        if (
+                            m_pos < self.tile_shape_K
+                            and n_pos < self.tile_shape_dV_dO
+                            and stage_pos < total_epi_stages_dV
+                        ):
+                            s_epi_dV[m_pos, n_within_pos, stage_pos] = v
                 cute.arch.fence_view_async_shared()
                 # Inter-WG barrier — both warp-groups must finish their writes
                 # before the leader warp reads SMEM via TMA.
                 cute.arch.barrier(barrier_id=5, number_of_threads=cta_threads)
                 # TMA bulk store, one (64, 64) box per stage.
                 if leader_warp and wg_idx == 0:
-                    for _stage in cutlass.range_constexpr(total_epi_stages):
+                    for _stage in cutlass.range_constexpr(total_epi_stages_dV):
                         sdV_stage = s_epi_dV[None, None, _stage]
                         gdV_stage = gdV_tma_epi[None, None, _stage]
                         td_sdV, td_gdV = cpasync.tma_partition(
@@ -3057,7 +3182,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
             else:
-                self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
+                self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, dV.shape[1]))
 
         cute.arch.fence_view_async_tmem_load()
         dkdv_handle.release()
@@ -3079,14 +3204,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         c = tTR_cdK_local[None, 0, _i][_j]
                         m_pos = c[0]
                         n_pos = c[1]
-                        stage_pos = n_pos // epi_cols_dKV
-                        n_within_pos = n_pos % epi_cols_dKV
+                        stage_pos = n_pos // epi_cols_dK
+                        n_within_pos = n_pos % epi_cols_dK
                         v = tTR_rdK_cast[None, 0, _i][_j]
-                        s_epi_dK[m_pos, n_within_pos, stage_pos] = v
+                        if (
+                            m_pos < self.tile_shape_K
+                            and n_pos < self.tile_shape_dQ_K
+                            and stage_pos < total_epi_stages_dK
+                        ):
+                            s_epi_dK[m_pos, n_within_pos, stage_pos] = v
                 cute.arch.fence_view_async_shared()
                 cute.arch.barrier(barrier_id=6, number_of_threads=cta_threads)
                 if leader_warp and wg_idx == 0:
-                    for _stage in cutlass.range_constexpr(total_epi_stages):
+                    for _stage in cutlass.range_constexpr(total_epi_stages_dK):
                         sdK_stage = s_epi_dK[None, None, _stage]
                         gdK_stage = gdK_tma_epi[None, None, _stage]
                         td_sdK, td_gdK = cpasync.tma_partition(
@@ -3100,7 +3230,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
             else:
-                self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
+                self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, dK.shape[1]))
 
         cute.arch.fence_view_async_tmem_load()
         dkdv_handle.release()

@@ -276,6 +276,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             cumulative_s_q,
             cumulative_s_k,
             scale_softmax,
+            dO,
             stream,
         )
         self.dkdv_kernel(

@@ -43,10 +43,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         is_persistent: bool,
         split_head: bool,
         use_clc_scheduler: bool = False,
+        csa_compress_ratio: int = 0,
     ):
         self.acc_dtype = acc_dtype
         self.mma_tiler = mma_tiler
         self.is_causal = is_causal
+        self.csa_compress_ratio = csa_compress_ratio
+        self.has_csa_compression = csa_compress_ratio > 0
         self.window_size_left = window_size_left
         # Keep original behavior (known-good in this repo)
         window_size_left = (
@@ -64,8 +67,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.is_local = (not self.is_causal) and (
             self.window_size_left is not None or self.window_size_right is not None
         )
-        assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
-        assert mma_tiler[2] == 256, "Only 256 is supported for 128x128 tile impl"
+        assert mma_tiler[0] in (64, 128) and mma_tiler[1] in (64, 128), (
+            "Only 64/128 tile dims are supported for this SM100 dQ impl"
+        )
+        assert mma_tiler[2] in (256, 512), "Only 256/512 head dims are supported"
         self.cta_tiler = (
             mma_tiler[0],
             mma_tiler[1],
@@ -135,6 +140,32 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.num_regs_other = 32
 
         self.buffer_align_bytes = 1024
+
+    @cute.jit
+    def _get_kv_trip_start_count(
+        self,
+        mma_block_coord: cute.Coord,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
+    ) -> Tuple[Int32, Int32]:
+        start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
+            mma_block_coord,
+            self.qk_mma_tiler,
+            seqlen_q,
+            seqlen_k,
+            self.is_causal,
+            self.is_local,
+            window_size_left,
+            window_size_right,
+        )
+        if cutlass.const_expr(self.has_csa_compression):
+            q_tile_end = min((mma_block_coord[0] + 1) * self.qk_mma_tiler[0], seqlen_q)
+            kv_visible = min(q_tile_end // self.csa_compress_ratio, seqlen_k)
+            start_count = Int32(0)
+            trip_count = cute.ceil_div(kv_visible, self.qk_mma_tiler[1])
+        return start_count, trip_count
 
     def _setup_attributes(self):
         self.q_stage = self.iterations_qk
@@ -943,13 +974,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                    FusedMask.get_trip_start_count_via_block_info(
+                    self._get_kv_trip_start_count(
                         mma_block_coord,
-                        self.qk_mma_tiler,
                         seqlen_q,
                         seqlen_k,
-                        self.is_causal,
-                        self.is_local,
                         window_size_left,
                         window_size_right,
                     )
@@ -1221,13 +1249,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                    FusedMask.get_trip_start_count_via_block_info(
+                    self._get_kv_trip_start_count(
                         mma_block_coord,
-                        self.qk_mma_tiler,
                         seqlen_q,
                         seqlen_k,
-                        self.is_causal,
-                        self.is_local,
                         window_size_left,
                         window_size_right,
                     )
@@ -1848,13 +1873,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 if cutlass.const_expr(cum_seqlen_k is not None):
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
+                start_count, trip_count = self._get_kv_trip_start_count(
                     mma_block_coord,
-                    self.qk_mma_tiler,
                     seqlen_q,
                     seqlen_k,
-                    self.is_causal,
-                    self.is_local,
                     window_size_left,
                     window_size_right,
                 )
@@ -1902,7 +1924,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         tdPcdP_iter = dov_thr_mma.partition_C(cdP_iter)
 
                         # Si, dPi -> dSi
-                        if cutlass.const_expr(self.use_semantic_trip_range):
+                        if cutlass.const_expr(self.has_csa_compression):
+                            need_apply_mask = True
+                        elif cutlass.const_expr(self.use_semantic_trip_range):
                             need_apply_mask = (
                                 step >= n_block_min_causal_local_mask
                                 or step < n_block_min_before_local_mask
@@ -1966,13 +1990,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                    FusedMask.get_trip_start_count_via_block_info(
+                    self._get_kv_trip_start_count(
                         mma_block_coord,
-                        self.qk_mma_tiler,
                         seqlen_q,
                         seqlen_k,
-                        self.is_causal,
-                        self.is_local,
                         window_size_left,
                         window_size_right,
                     )
@@ -2103,6 +2124,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 window_size_left,
                 window_size_right,
             )
+            if cutlass.const_expr(self.has_csa_compression):
+                for i in cutlass.range_constexpr(cute.size(tTMEM_LOADrS), unroll_full=True):
+                    pos = tTMEM_LOADcS[i]
+                    q_idx = cute.get(pos, mode=[0])
+                    kv_idx = cute.get(pos, mode=[1])
+                    if kv_idx >= ((q_idx + 1) // self.csa_compress_ratio):
+                        tTMEM_LOADrS[i] = -cutlass.Float32.inf
 
         log2_e = cutlass.Float32(math.log2(math.e))
         softmax_scale_log2_e = scale_softmax * log2_e
@@ -2169,7 +2197,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.St32x32bOp(tcgen05.Repetition(32)), self.acc_dtype
         )
-        tilePlikeFP32 = tdPtdP_slice.shape[1] // Float32.width * self.q_dtype.width
+        tilePlikeFP32 = cute.size(tdPtdP_slice.shape[1]) // Float32.width * self.q_dtype.width
         tdPtdP_dS_layout = cute.composition(
             tdPtdP_slice.layout, cute.make_layout((tdPtdP_slice.shape[0], tilePlikeFP32))
         )

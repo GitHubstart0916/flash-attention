@@ -2176,12 +2176,34 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         swa_window_size: Optional[int] = None,
     ):
         shared_kv = k is v
+        qv_from_q_arg = False
         if shared_kv and v.shape[-1] == 512:
             # specialize MLA attention formula
             # O = softmax(Q @ K.T + Qv @ V.T) @ V
             # by setting q, k to None
-            qv = q if qv is None else qv
+            if qv is None:
+                qv = q
+                qv_from_q_arg = True
             q = k = None
+        csa_mla_bwd = (
+            q is None
+            and qv is not None
+            and k is None
+            and v.shape[-1] == 512
+            and cu_seqlens_q is not None
+            and cu_seqlens_k is not None
+            and gather_kv_indices is None
+            and page_table is None
+            and score_mod is None
+            and score_mod_bwd is None
+            and mask_mod is None
+            and block_sparse_tensors is None
+            and aux_tensors is None
+            and (swa_window_size is not None or compress_ratio != 1)
+        )
+        cu_seqlens_swa_saved = cu_seqlens_swa
+        if csa_mla_bwd and cu_seqlens_swa_saved is None:
+            cu_seqlens_swa_saved = torch.zeros_like(cu_seqlens_q)
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -2219,12 +2241,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q,
             k,
             v,
+            qv,
+            swa_kv,
             out,
             lse,
             cu_seqlens_q,
             cu_seqlens_k,
+            cu_seqlens_swa_saved,
             seqused_q,
             seqused_k,
+            learnable_sink,
             *(aux_tensors or ()),
         )
         ctx.softmax_scale = softmax_scale
@@ -2234,6 +2260,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.max_seqlen_swa = max_seqlen_swa
+        ctx.swa_window_size = swa_window_size
+        ctx.compress_ratio = compress_ratio
+        ctx.csa_mla_bwd = csa_mla_bwd
+        ctx.qv_from_q_arg = qv_from_q_arg
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
@@ -2242,12 +2273,85 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
+        (
+            q,
+            k,
+            v,
+            qv,
+            swa_kv,
+            out,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_seqlens_swa,
+            seqused_q,
+            seqused_k,
+            learnable_sink,
+            *aux,
+        ) = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
         if dout is None:
             dout = torch.zeros_like(out)
+        if ctx.csa_mla_bwd:
+            from flash_attn.cute.csa_bwd_cute import csa_mla_varlen_bwd
+
+            dqv, dswa_kv, dcomp_kv, d_sink = csa_mla_varlen_bwd(
+                qv,
+                swa_kv,
+                v,
+                out,
+                dout,
+                lse,
+                cu_seqlens_q,
+                cu_seqlens_swa,
+                cu_seqlens_k,
+                ctx.max_seqlen_q,
+                ctx.max_seqlen_swa,
+                ctx.max_seqlen_k,
+                ctx.swa_window_size,
+                learnable_sink,
+                ctx.compress_ratio,
+                softmax_scale=ctx.softmax_scale,
+                dlse=dlse,
+            )
+            dq_arg = dqv if ctx.qv_from_q_arg else None
+            dqv_arg = None if ctx.qv_from_q_arg else dqv
+            return (
+                dq_arg,
+                None,
+                dcomp_kv,
+                dqv_arg,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                d_sink,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                dswa_kv,
+                None,
+                None,
+                None,
+            )
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,
